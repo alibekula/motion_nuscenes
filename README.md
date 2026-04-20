@@ -1,64 +1,116 @@
-# Motion Prediction V1: Сценовый baseline на nuScenes
+# motion_prediction_v1
 
-Автономный baseline для scene-level multi-agent motion prediction на датасете `nuScenes`. Репозиторий собран вокруг чистого пайплайна с offline-артефактами, локальным контекстом сцены в ego-frame и компактной двухэтапной anchor-based архитектурой.
+Сценовый baseline для multi-agent motion prediction на `nuScenes`.
 
-## Описание
+## Overview
 
-Проект сделан как читаемая и практичная реализация, а не как большой экспериментальный фреймворк. Основная идея простая:
+Этот проект собран как чистый и воспроизводимый baseline для предсказания траекторий в сценах автономного вождения. Базовый принцип здесь простой: один sample соответствует одному keyframe, все агенты и элементы карты приводятся к текущей ego-системе координат, а модель работает с полностью подготовленными scene-level тензорами без online-преобразований в training loop.
 
-- собирать сценовые обучающие примеры offline
-- держать входной контракт модели стабильным и предсказуемым
-- явно кодировать локальную геометрию карты и статические объекты
-- предсказывать будущее движение через двухэтапный anchor-based decoder
+Модель предсказывает `K=64` мультимодальных будущих траекторий для каждого агента на горизонте `6` секунд через двухэтапный anchor-based decoder.
 
-За счёт этого код проще читать, обучать и расширять без старых экспериментальных веток и лишней совместимости.
+## Results
 
-## Пайплайн данных
+| Metric | Value |
+|--------|-------|
+| val ADE | 1.4193 |
+| val FDE | 3.2450 |
 
-Обучение опирается на offline-подготовку артефактов. Вместо того чтобы пересобирать полное представление сцены на каждом training step, проект разделяет preprocessing и model execution:
+Лучший результат относится к финальной V1-конфигурации с offline-артефактами и anchor-based routing.
 
-- доступ к сырым данным `nuScenes` и базовые датасетные утилиты находятся в `data/`
-- offline-подготовка артефактов находится в `preprocessing/`
-- финальный V1-путь для обучения на готовых артефактах находится в `motion_v1/`
-
-Такой подход ускоряет итерации и делает поведение модели более стабильным, потому что после генерации артефактов batch contract больше не плавает между запусками.
-
-## Архитектура
-
-Модель построена как сценовый baseline с тремя основными идеями:
-
-- история движения агентов кодируется в компактные per-agent токены
-- элементы карты и статические объекты кодируются отдельно, а затем объединяются в общее представление сцены
-- предсказание будущей траектории делается двухэтапным decoder'ом: сначала определяется ближняя динамика, затем она разворачивается в итоговый forecast
-
-Реализация намеренно оставлена компактной: точка входа для обучения вынесена в `train.py`, а основная V1-логика сосредоточена в небольшом наборе модулей.
-
-## Структура репозитория
+## Architecture
 
 ```text
-motion_nuscenes/
-├── motion_v1/
-├── data/
-├── preprocessing/
-├── docs/
-├── .gitignore
-├── README.md
-└── train.py
+HistoryEncoder (GRU)
+    └── 18-мерный признак на шаг: x, y, cos/sin yaw, vx, vy, yaw_rate, width, length, class_onehot[9]
+    └── явная кинематическая сводка: v_last, mean_speed, accel, mean_yaw_rate
+
+MapEncoder
+    └── polylines: point MLP + attribute MLP (lane, lane_connector, divider)
+    └── objects: MLP (ped_crossing, stop_line, traffic_light, carpark_area)
+
+SceneEncoder (TransformerEncoder)
+    └── agent tokens + polyline tokens + object tokens в общей ego-системе координат
+
+AnchorDecoder (two-stage)
+    └── stage1: 3-секундный prefix → компактный plan vector (A6 bank)
+    └── stage2: полный 6-секундный rollout с условием от stage1 (A12 bank)
 ```
 
-- `motion_v1/` содержит основной V1 dataloader, геометрию, маппинг категорий и модель
-- `data/` содержит код для работы с `nuScenes` и датасетные утилиты
-- `preprocessing/` содержит offline-препроцессинг и генерацию артефактов
-- `train.py` — отдельная точка входа для обучения
+## Data Pipeline
 
-## Пример сцены
+Offline preprocessing отделяет подготовку данных от обучения:
+
+1. `Scene windows`
+   Для финального лучшего запуска использовались окна с историей и будущим фиксированной длины.
+2. `Agent filtering`
+   В артефакты попадают только агенты с полным треком на всём нужном интервале, без partial trajectories и без runtime-достройки пропусков.
+3. `Map store`
+   Строится один раз на уровень `map_name`; lane/connector/divider геометрия векторизуется заранее, а локальный контекст сцены выбирается вокруг ego-позиции.
+4. `Anchor bank`
+   Строится offline по agent-local directional profiles и используется как routing-пространство для мультимодального предсказания.
+5. `Artifacts`
+   Сохраняются на диск, после чего train loader в основном только читает, паддит и возвращает готовые тензоры.
+
+## Loss Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| soft_anchor_topk | 6 |
+| soft_anchor_tau | 0.2 |
+| predicted_topk | 3 |
+| predicted_anchor_detach | True |
+| cls_focal_gamma | 1.5 |
+| stationary_cls_weight | 0.4 |
+| gt_cond_weight | 0 |
+
+В финальной схеме stage2 обучается на предсказанном выходе stage1, а `detach=True` на mixture-routing помогает не портить классификационную ветку регрессионными градиентами.
+
+## Key Ablations
+
+| Setting | val ADE |
+|---------|---------|
+| hard WTA | 1.4378 |
+| predicted_topk=6 | 1.4262 |
+| predicted_topk=3 | 1.4193 |
+
+## Qualitative Example
 
 Ниже показан пример BEV-сцены с историей движения, ground-truth будущим и предсказанной траекторией в ego-frame.
 
 ![BEV trajectory example](docs/assets/bev_example.png)
 
-## Замечания
+## Requirements
 
-- репозиторий задуман как лёгкий и code-focused
-- чекпоинты, сгенерированные артефакты и другие тяжёлые файлы по умолчанию игнорируются
-- пути оставлены переносимыми и передаются через аргументы, а не захардкожены под одну машину
+```text
+torch
+nuscenes-devkit
+numpy
+tqdm
+shapely
+```
+
+## Project Structure
+
+```text
+motion_nuscenes/
+├── motion_v1/
+│   ├── dataloader.py
+│   ├── model.py
+│   ├── categories.py
+│   ├── geometry.py
+│   └── __init__.py
+├── data/
+│   ├── motion_dataset.py
+│   ├── preprocessed_dataset.py
+│   ├── nuscenes_utils.py
+│   └── __init__.py
+├── preprocessing/
+│   ├── offline_preprocessing.py
+│   └── __init__.py
+├── docs/
+│   └── assets/
+│       └── bev_example.png
+├── .gitignore
+├── README.md
+└── train.py
+```
