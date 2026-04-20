@@ -1,39 +1,39 @@
-# Motion Prediction V1: Scene-Level Baseline on nuScenes
+# Motion Prediction V1: Сценовый baseline на nuScenes
 
-Standalone scene-level multi-agent motion prediction baseline built on the nuScenes dataset. The repository is organized around a clean artifact-based pipeline, local scene context in the ego frame, and a compact two-stage anchor-based forecasting model.
+Автономный baseline для scene-level multi-agent motion prediction на датасете `nuScenes`. Репозиторий собран вокруг чистого пайплайна с offline-артефактами, локальным контекстом сцены в ego-frame и компактной двухэтапной anchor-based архитектурой.
 
-## Overview
+## Описание
 
-This project focuses on a practical and readable motion prediction stack rather than a large experimental framework. The core idea is simple:
+Проект сделан как читаемая и практичная реализация, а не как большой экспериментальный фреймворк. Основная идея простая:
 
-- build scene-centric training samples offline
-- keep the model input contract clean and stable
-- represent local map structure explicitly with vectorized geometry
-- predict future motion with a staged anchor-based decoder
+- собирать сценовые обучающие примеры offline
+- держать входной контракт модели стабильным и предсказуемым
+- явно кодировать локальную геометрию карты и статические объекты
+- предсказывать будущее движение через двухэтапный anchor-based decoder
 
-The result is a repository that is easier to inspect, train, and extend without dragging along older experimental code paths.
+За счёт этого код проще читать, обучать и расширять без старых экспериментальных веток и лишней совместимости.
 
-## Data Pipeline
+## Пайплайн данных
 
-The training path is centered on offline artifact generation. Instead of rebuilding the full scene representation during every training step, the repository separates preprocessing from model execution:
+Обучение опирается на offline-подготовку артефактов. Вместо того чтобы пересобирать полное представление сцены на каждом training step, проект разделяет preprocessing и model execution:
 
-- raw nuScenes access and indexing live in `data/`
-- offline artifact generation lives in `preprocessing/`
-- the final artifact-driven training path lives in `motion_v1/`
+- доступ к сырым данным `nuScenes` и базовые датасетные утилиты находятся в `data/`
+- offline-подготовка артефактов находится в `preprocessing/`
+- финальный V1-путь для обучения на готовых артефактах находится в `motion_v1/`
 
-This keeps training iterations fast and makes model behavior easier to compare across runs because the batch contract stays fixed once artifacts are created.
+Такой подход ускоряет итерации и делает поведение модели более стабильным, потому что после генерации артефактов batch contract больше не плавает между запусками.
 
-## Model Design
+## Архитектура
 
-The model is built as a scene-level baseline with three main ideas:
+Модель построена как сценовый baseline с тремя основными идеями:
 
-- agent motion history is encoded into compact per-agent tokens
-- map elements and static scene objects are encoded separately and fused into the same scene representation
-- future prediction is produced by a two-stage anchor-based decoder that first captures near-term intent and then rolls that information into the final trajectory forecast
+- история движения агентов кодируется в компактные per-agent токены
+- элементы карты и статические объекты кодируются отдельно, а затем объединяются в общее представление сцены
+- предсказание будущей траектории делается двухэтапным decoder'ом: сначала определяется ближняя динамика, затем она разворачивается в итоговый forecast
 
-The implementation is intentionally compact: the training entry point is isolated in `train.py`, and the main V1 logic is concentrated in a small number of readable modules.
+Реализация намеренно оставлена компактной: точка входа для обучения вынесена в `train.py`, а основная V1-логика сосредоточена в небольшом наборе модулей.
 
-## Repository Layout
+## Структура репозитория
 
 ```text
 motion_nuscenes/
@@ -46,19 +46,19 @@ motion_nuscenes/
 └── train.py
 ```
 
-- `motion_v1/` contains the main V1 dataloader, geometry helpers, category mapping, and model code
-- `data/` contains nuScenes-facing dataset and utility code
-- `preprocessing/` contains offline preprocessing utilities for artifact generation
-- `train.py` is the standalone training entry point
+- `motion_v1/` содержит основной V1 dataloader, геометрию, маппинг категорий и модель
+- `data/` содержит код для работы с `nuScenes` и датасетные утилиты
+- `preprocessing/` содержит offline-препроцессинг и генерацию артефактов
+- `train.py` — отдельная точка входа для обучения
 
-## Qualitative Example
+## Пример сцены
 
-The figure below shows a BEV scene example with motion history, ground-truth future, and predicted future in the ego frame.
+Ниже показан пример BEV-сцены с историей движения, ground-truth будущим и предсказанной траекторией в ego-frame.
 
 ![BEV trajectory example](docs/assets/bev_example.png)
 
-## Notes
+## Замечания
 
-- the repository is intended to stay lightweight and code-focused
-- checkpoints, generated artifacts, and other heavy outputs are ignored by default
-- paths are kept portable and are passed through arguments instead of being hardcoded to one machine
+- репозиторий задуман как лёгкий и code-focused
+- чекпоинты, сгенерированные артефакты и другие тяжёлые файлы по умолчанию игнорируются
+- пути оставлены переносимыми и передаются через аргументы, а не захардкожены под одну машину
