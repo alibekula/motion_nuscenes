@@ -91,20 +91,22 @@ shapely
 
 ## Project Structure
 
+`motion_v1` и `data` здесь намеренно разделены. `motion_v1` содержит модель, V1-загрузчик и общие геометрические утилиты, а `data` отвечает за raw/preprocessed dataset abstractions и `nuScenes`-специфичные вспомогательные функции, которые используются офлайн-препроцессингом и частью пайплайна подготовки данных.
+
 ```text
 motion_nuscenes/
-├── motion_v1/
+├── motion_v1/               # модель, V1 dataloader и базовые геометрические утилиты
 │   ├── dataloader.py
 │   ├── model.py
 │   ├── categories.py
 │   ├── geometry.py
 │   └── __init__.py
-├── data/
+├── data/                    # raw/preprocessed dataset wrappers и nuScenes utilities
 │   ├── motion_dataset.py
 │   ├── preprocessed_dataset.py
 │   ├── nuscenes_utils.py
 │   └── __init__.py
-├── preprocessing/
+├── preprocessing/           # офлайн-генерация артефактов и anchor bank
 │   ├── offline_preprocessing.py
 │   └── __init__.py
 ├── docs/
