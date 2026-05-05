@@ -17,25 +17,6 @@
 
 Лучший результат относится к финальной V1-конфигурации с artifact payload и anchor-based routing.
 
-## Architecture
-
-```text
-HistoryEncoder (GRU)
-    └── 18-мерный признак на шаг: x, y, cos/sin yaw, vx, vy, yaw_rate, width, length, class_onehot[9]
-    └── явная кинематическая сводка: v_last, mean_speed, accel, mean_yaw_rate
-
-MapEncoder
-    └── polylines: point MLP + attribute MLP (lane, lane_connector, divider)
-    └── objects: MLP (ped_crossing, stop_line, traffic_light, carpark_area)
-
-SceneEncoder (TransformerEncoder)
-    └── agent tokens + polyline tokens + object tokens в общей ego-системе координат
-
-AnchorDecoder (two-stage)
-    └── stage1: 3-секундный prefix → компактный plan vector (A6 bank)
-    └── stage2: полный 6-секундный rollout с условием от stage1 (A12 bank)
-```
-
 ## Data Pipeline
 
 Artifact build отделяет подготовку данных от обучения. В репозитории поддерживается один контракт данных: V1 artifact payload из `motion_v1/dataloader.py`.
@@ -57,26 +38,20 @@ flowchart TD
     G --> J
     I --> J
 
-    J --> K["_collect_agents"]
-    K --> L["_build_agent_entry per agent"]
-    L --> M["history_features and future_positions_ego"]
+    J --> K["_collect_agents + _build_agent_entry"]
+    K --> L["agent tensors"]
 
-    J --> N["_select_local_map"]
-    N --> O["polyline and object tensors"]
+    J --> M["_select_local_map"]
+    M --> N["map tensors"]
 
-    M --> P["V1 sample dict"]
-    O --> P
+    L --> P["V1 sample dict"]
+    N --> P
     P --> Q["build_artifact_payload"]
     Q --> R["V1 artifact payload"]
 
-    R --> S["V1ArtifactDataset"]
-    S --> T["__getitem__"]
-    T --> U["_apply_scene_augmentation"]
-    U --> V["collate_v1_batch"]
-    V --> W["padded scene batch"]
-    W --> X["V1MotionModel.forward"]
-    X --> Y["compute_v1_losses"]
-    Y --> Z["train update"]
+    R --> S["V1ArtifactDataset.__getitem__ + optional augmentation"]
+    S --> T["collate_v1_batch"]
+    T --> U["padded scene batch"]
 ```
 
 1. `Scene windows`
@@ -89,6 +64,37 @@ flowchart TD
    Строится по agent-local directional profiles и используется как routing-пространство для мультимодального предсказания.
 5. `Artifacts`
    Сохраняются на диск, после чего train loader в основном только читает, паддит и возвращает готовые тензоры.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    A["padded scene batch"] --> B["HistoryEncoder"]
+    A --> C["motion summaries"]
+    A --> D["MapEncoder"]
+
+    B --> E["history tokens"]
+    C --> F["agent tokens"]
+    E --> F
+
+    D --> G["polyline tokens"]
+    D --> H["object tokens"]
+
+    F --> I["SceneEncoder"]
+    G --> I
+    H --> I
+
+    I --> J["scene agent tokens"]
+    J --> K["AnchorDecoder stage1 / A6"]
+    K --> L["6-step scores and trajectories"]
+
+    L --> M["conditioning"]
+    J --> M
+    M --> N["conditioned agent tokens"]
+
+    N --> O["AnchorDecoder stage2 / A12"]
+    O --> P["12-step scores and trajectories"]
+```
 
 ## Loss Configuration
 
