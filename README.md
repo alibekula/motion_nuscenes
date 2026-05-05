@@ -4,7 +4,7 @@
 
 ## Overview
 
-Этот проект собран как чистый и воспроизводимый baseline для предсказания траекторий в сценах автономного вождения. Базовый принцип здесь простой: один sample соответствует одному keyframe, все агенты и элементы карты приводятся к текущей ego-системе координат, а модель работает с полностью подготовленными scene-level тензорами без online-преобразований в training loop.
+Этот проект собран как чистый и воспроизводимый baseline для предсказания траекторий в сценах автономного вождения. Базовый принцип здесь простой: один sample соответствует одному V1 scene window с reference keyframe, все агенты и элементы карты приводятся к ego-системе координат этого reference frame, а модель работает с полностью подготовленными scene-level тензорами без runtime-достройки пропусков в training loop.
 
 Модель предсказывает `K=64` мультимодальных будущих траекторий для каждого агента на горизонте `6` секунд через двухэтапный anchor-based decoder.
 
@@ -15,7 +15,7 @@
 | val ADE | 1.4193 |
 | val FDE | 3.2450 |
 
-Лучший результат относится к финальной V1-конфигурации с offline-артефактами и anchor-based routing.
+Лучший результат относится к финальной V1-конфигурации с artifact payload и anchor-based routing.
 
 ## Architecture
 
@@ -38,7 +38,7 @@ AnchorDecoder (two-stage)
 
 ## Data Pipeline
 
-Offline preprocessing отделяет подготовку данных от обучения:
+Artifact build отделяет подготовку данных от обучения. В репозитории поддерживается один контракт данных: V1 artifact payload из `motion_v1/dataloader.py`.
 
 1. `Scene windows`
    Для финального лучшего запуска использовались окна с историей и будущим фиксированной длины.
@@ -47,7 +47,7 @@ Offline preprocessing отделяет подготовку данных от о
 3. `Map store`
    Строится один раз на уровень `map_name`; lane/connector/divider геометрия векторизуется заранее, а локальный контекст сцены выбирается вокруг ego-позиции.
 4. `Anchor bank`
-   Строится offline по agent-local directional profiles и используется как routing-пространство для мультимодального предсказания.
+   Строится по agent-local directional profiles и используется как routing-пространство для мультимодального предсказания.
 5. `Artifacts`
    Сохраняются на диск, после чего train loader в основном только читает, паддит и возвращает готовые тензоры.
 
@@ -91,7 +91,7 @@ shapely
 
 ## Project Structure
 
-`motion_v1` и `data` здесь намеренно разделены. `motion_v1` содержит модель, V1-загрузчик и общие геометрические утилиты, а `data` отвечает за raw/preprocessed dataset abstractions и `nuScenes`-специфичные вспомогательные функции, которые используются офлайн-препроцессингом и частью пайплайна подготовки данных.
+`motion_v1` содержит единственный актуальный пайплайн: сборку V1 artifact payload, dataloader, модель, loss и геометрические утилиты. `data` оставлен только для небольших `nuScenes`-специфичных helper-функций, которые нужны V1-загрузчику.
 
 ```text
 motion_nuscenes/
@@ -101,13 +101,8 @@ motion_nuscenes/
 │   ├── categories.py
 │   ├── geometry.py
 │   └── __init__.py
-├── data/                    # raw/preprocessed dataset wrappers и nuScenes utilities
-│   ├── motion_dataset.py
-│   ├── preprocessed_dataset.py
+├── data/                    # nuScenes utilities для V1 dataloader
 │   ├── nuscenes_utils.py
-│   └── __init__.py
-├── preprocessing/           # офлайн-генерация артефактов и anchor bank
-│   ├── offline_preprocessing.py
 │   └── __init__.py
 ├── docs/
 │   └── assets/
