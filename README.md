@@ -40,6 +40,45 @@ AnchorDecoder (two-stage)
 
 Artifact build отделяет подготовку данных от обучения. В репозитории поддерживается один контракт данных: V1 artifact payload из `motion_v1/dataloader.py`.
 
+```mermaid
+flowchart TD
+    A["nuScenes raw scenes and maps"] --> B["build_v1_map_store"]
+    B --> C["global map store by map_name"]
+
+    A --> D["V1WindowDataset"]
+    D --> E["_index_scenes"]
+    E --> F["ego frames by scene"]
+    E --> G["agent frames by scene"]
+    D --> H["_build_windows"]
+    H --> I["fixed scene windows"]
+
+    C --> J["_build_sample(idx)"]
+    F --> J
+    G --> J
+    I --> J
+
+    J --> K["_collect_agents"]
+    K --> L["_build_agent_entry per agent"]
+    L --> M["history_features and future_positions_ego"]
+
+    J --> N["_select_local_map"]
+    N --> O["polyline and object tensors"]
+
+    M --> P["V1 sample dict"]
+    O --> P
+    P --> Q["build_artifact_payload"]
+    Q --> R["V1 artifact payload"]
+
+    R --> S["V1ArtifactDataset"]
+    S --> T["__getitem__"]
+    T --> U["_apply_scene_augmentation"]
+    U --> V["collate_v1_batch"]
+    V --> W["padded scene batch"]
+    W --> X["V1MotionModel.forward"]
+    X --> Y["compute_v1_losses"]
+    Y --> Z["train update"]
+```
+
 1. `Scene windows`
    Для финального лучшего запуска использовались окна с историей и будущим фиксированной длины.
 2. `Agent filtering`
