@@ -45,6 +45,9 @@ class V1AugmentationConfig:
     apply_prob: float = 0.8
     max_rotation_deg: float = 22.5
     translation_std_m: float = 1.0
+    history_xy_noise_std_m: float = 0.0
+    history_yaw_noise_std_deg: float = 0.0
+    dt: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -119,6 +122,59 @@ def _rotation_matrix(angle_rad: float) -> torch.Tensor:
     )
 
 
+def _wrap_torch_angle(angle: torch.Tensor) -> torch.Tensor:
+    return torch.remainder(angle + math.pi, 2.0 * math.pi) - math.pi
+
+
+def _recompute_history_kinematics(history_features: torch.Tensor, agent_slice: slice, dt: float) -> None:
+    xy = history_features[agent_slice, :, 0:2]
+    yaw = torch.atan2(history_features[agent_slice, :, 3], history_features[agent_slice, :, 2])
+    num_steps = int(xy.shape[1])
+    if num_steps < 2:
+        return
+
+    velocity = torch.zeros_like(xy)
+    yaw_rate = torch.zeros_like(yaw)
+    safe_dt = max(float(dt), 1e-6)
+
+    velocity[:, 0] = (xy[:, 1] - xy[:, 0]) / safe_dt
+    velocity[:, -1] = (xy[:, -1] - xy[:, -2]) / safe_dt
+    yaw_rate[:, 0] = _wrap_torch_angle(yaw[:, 1] - yaw[:, 0]) / safe_dt
+    yaw_rate[:, -1] = _wrap_torch_angle(yaw[:, -1] - yaw[:, -2]) / safe_dt
+
+    if num_steps > 2:
+        velocity[:, 1:-1] = (xy[:, 2:] - xy[:, :-2]) / (2.0 * safe_dt)
+        yaw_rate[:, 1:-1] = _wrap_torch_angle(yaw[:, 2:] - yaw[:, :-2]) / (2.0 * safe_dt)
+
+    history_features[agent_slice, :, 4:6] = velocity
+    history_features[agent_slice, :, 6] = yaw_rate
+
+
+def _apply_history_observation_noise(history_features: torch.Tensor, cfg: V1AugmentationConfig) -> None:
+    if history_features.shape[0] <= 1:
+        return
+
+    agent_slice = slice(1, None)
+    xy_std = float(cfg.history_xy_noise_std_m)
+    yaw_std_rad = math.radians(float(cfg.history_yaw_noise_std_deg))
+    if xy_std <= 0.0 and yaw_std_rad <= 0.0:
+        return
+
+    if xy_std > 0.0:
+        history_features[agent_slice, :, 0:2] = (
+            history_features[agent_slice, :, 0:2]
+            + torch.randn_like(history_features[agent_slice, :, 0:2]) * xy_std
+        )
+
+    if yaw_std_rad > 0.0:
+        yaw = torch.atan2(history_features[agent_slice, :, 3], history_features[agent_slice, :, 2])
+        yaw = yaw + torch.randn_like(yaw) * yaw_std_rad
+        history_features[agent_slice, :, 2] = torch.cos(yaw)
+        history_features[agent_slice, :, 3] = torch.sin(yaw)
+
+    _recompute_history_kinematics(history_features, agent_slice=agent_slice, dt=float(cfg.dt))
+
+
 def _apply_scene_augmentation(sample: dict[str, Any], cfg: V1AugmentationConfig | None) -> dict[str, Any]:
     if cfg is None or not cfg.enabled:
         return sample
@@ -141,6 +197,7 @@ def _apply_scene_augmentation(sample: dict[str, Any], cfg: V1AugmentationConfig 
     history_features[..., 0:2] = history_features[..., 0:2] @ rotation + translation.view(1, 1, 2)
     history_features[..., 2:4] = history_features[..., 2:4] @ rotation
     history_features[..., 4:6] = history_features[..., 4:6] @ rotation
+    _apply_history_observation_noise(history_features, cfg)
     augmented["history_features"] = history_features
 
     future_positions_ego = sample["future_positions_ego"].clone()

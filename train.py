@@ -160,6 +160,8 @@ def main():
     parser.add_argument("--train-aug-prob", type=float, default=0.8)
     parser.add_argument("--train-max-rotation-deg", type=float, default=10.0)
     parser.add_argument("--train-translation-std-m", type=float, default=0.0)
+    parser.add_argument("--train-history-xy-noise-std-m", type=float, default=0.0)
+    parser.add_argument("--train-history-yaw-noise-std-deg", type=float, default=0.0)
     parser.add_argument("--stage1-weight", type=float, default=0.5)
     parser.add_argument("--stage2-weight", type=float, default=1.0)
     parser.add_argument("--stage1-warmup-epochs", type=int, default=0)
@@ -191,7 +193,10 @@ def main():
         apply_prob=args.train_aug_prob,
         max_rotation_deg=args.train_max_rotation_deg,
         translation_std_m=args.train_translation_std_m,
+        history_xy_noise_std_m=args.train_history_xy_noise_std_m,
+        history_yaw_noise_std_deg=args.train_history_yaw_noise_std_deg,
     )
+    print(f"Train augmentation config: {train_aug}")
 
     train_dataset = V1ArtifactDataset(args.train_artifact, augmentation=train_aug)
     val_dataset = V1ArtifactDataset(args.val_artifact, augmentation=None)
