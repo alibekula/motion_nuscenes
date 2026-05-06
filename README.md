@@ -38,8 +38,9 @@ flowchart TD
     G --> J
     I --> J
 
-    J --> K["_collect_agents + _build_agent_entry"]
-    K --> L["agent tensors"]
+    J --> K["_collect_agents"]
+    K --> K2["_build_agent_entry"]
+    K2 --> L["agent tensors"]
 
     J --> M["_select_local_map"]
     M --> N["map tensors"]
@@ -56,8 +57,8 @@ flowchart TD
 
 1. `Scene windows`
    Для финального лучшего запуска использовались окна с историей и будущим фиксированной длины.
-2. `Agent filtering`
-   В артефакты попадают только агенты с полным треком на всём нужном интервале, без partial trajectories и без runtime-достройки пропусков.
+2. `Agent selection`
+   Целевые агенты выбираются из reference keyframe; для каждого собирается фиксированное history+future окно.
 3. `Map store`
    Строится один раз на уровень `map_name`; lane/connector/divider геометрия векторизуется заранее, а локальный контекст сцены выбирается вокруг ego-позиции.
 4. `Anchor bank`
