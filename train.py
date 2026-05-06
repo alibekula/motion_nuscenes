@@ -47,6 +47,11 @@ def _seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def _positive_int_or_none(value):
+    value = int(value)
+    return value if value > 0 else None
+
+
 def train_one_epoch(
     model,
     loader,
@@ -56,6 +61,7 @@ def train_one_epoch(
     scaler,
     grad_clip=1.0,
     use_amp=True,
+    gt_cond_weight=0.0,
 ):
     model.train()
     running = {}
@@ -69,7 +75,7 @@ def train_one_epoch(
 
         amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if amp_enabled else nullcontext()
         with amp_ctx:
-            outputs = model(batch, gt_cond_weight=0.0)
+            outputs = model(batch, gt_cond_weight=gt_cond_weight)
             loss, metrics = compute_v1_losses(outputs, batch, loss_cfg)
 
         if amp_enabled:
@@ -126,10 +132,28 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--eta-min", type=float, default=1e-5)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--disable-amp", action="store_true")
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--disable-pose-encoding", action="store_true")
+    parser.add_argument("--disable-relative-encoding", action="store_true")
+    parser.add_argument("--pose-radius-m", type=float, default=80.0)
+    parser.add_argument("--train-aug-prob", type=float, default=0.8)
+    parser.add_argument("--train-max-rotation-deg", type=float, default=10.0)
+    parser.add_argument("--train-translation-std-m", type=float, default=0.0)
+    parser.add_argument("--cls-focal-gamma", type=float, default=1.5)
+    parser.add_argument("--stationary-cls-weight", type=float, default=0.4)
+    parser.add_argument("--soft-anchor-tau", type=float, default=0.2)
+    parser.add_argument("--soft-anchor-topk", type=int, default=6, help="Use 0 to disable top-k masking.")
+    parser.add_argument("--regression-mode", type=str, choices=("gt_wta", "predicted_topk"), default="predicted_topk")
+    parser.add_argument("--predicted-anchor-topk", type=int, default=3, help="Use 0 to use all predicted anchors.")
+    parser.add_argument("--predicted-anchor-detach", dest="predicted_anchor_detach", action="store_true", default=True)
+    parser.add_argument("--no-predicted-anchor-detach", dest="predicted_anchor_detach", action="store_false")
+    parser.add_argument("--gt-cond-weight", type=float, default=0.0)
     args = parser.parse_args()
 
     _seed_everything(args.seed)
@@ -145,9 +169,9 @@ def main():
 
     train_aug = V1AugmentationConfig(
         enabled=True,
-        apply_prob=0.8,
-        max_rotation_deg=10.0,
-        translation_std_m=0.0,
+        apply_prob=args.train_aug_prob,
+        max_rotation_deg=args.train_max_rotation_deg,
+        translation_std_m=args.train_translation_std_m,
     )
 
     train_dataset = V1ArtifactDataset(args.train_artifact, augmentation=train_aug)
@@ -185,21 +209,26 @@ def main():
         k12=int(len(anchor_bank["full_bank"])),
         k6=int(len(anchor_bank["prefix_bank"])),
         r_max=float(anchor_bank.get("r_max", 1.0)),
-        dropout=0.2,
+        dropout=args.dropout,
+        use_pose_encoding=not args.disable_pose_encoding,
+        use_relative_encoding=not args.disable_relative_encoding,
+        pose_radius_m=args.pose_radius_m,
     )
     model = V1MotionModel(model_cfg, anchor_bank).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.eta_min)
     loss_cfg = V1LossConfig(
-        cls_focal_gamma=1.5,
-        stationary_cls_weight=0.4,
-        soft_anchor_tau=0.2,
-        soft_anchor_topk=6,
-        regression_mode="predicted_topk",
-        predicted_anchor_topk=3,
-        predicted_anchor_detach=True,
+        cls_focal_gamma=args.cls_focal_gamma,
+        stationary_cls_weight=args.stationary_cls_weight,
+        soft_anchor_tau=args.soft_anchor_tau,
+        soft_anchor_topk=_positive_int_or_none(args.soft_anchor_topk),
+        regression_mode=args.regression_mode,
+        predicted_anchor_topk=_positive_int_or_none(args.predicted_anchor_topk),
+        predicted_anchor_detach=args.predicted_anchor_detach,
     )
+    print(f"Model config: {model_cfg}")
+    print(f"Loss config: {loss_cfg}")
 
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and not args.disable_amp))
     best_val_top1_ade = float("inf")
@@ -216,6 +245,7 @@ def main():
             scaler,
             grad_clip=args.grad_clip,
             use_amp=not args.disable_amp,
+            gt_cond_weight=args.gt_cond_weight,
         )
         val_metrics = validate_one_epoch(model, val_loader, device, loss_cfg)
         scheduler.step()
@@ -243,6 +273,7 @@ def main():
                     "val_artifact_path": str(Path(args.val_artifact).resolve()),
                     "train_artifact_sha256": train_artifact_hash,
                     "val_artifact_sha256": val_artifact_hash,
+                    "train_args": vars(args),
                 },
                 checkpoint_path,
             )
