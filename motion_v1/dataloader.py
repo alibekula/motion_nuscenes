@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 import heapq
 import math
+import shutil
 
 import numpy as np
 import torch
@@ -281,6 +282,23 @@ def _object_feature(record: _ObjectRecord, ego_xy_global: np.ndarray, ego_yaw_gl
         ],
         axis=0,
     ).astype(np.float32, copy=False)
+
+
+def _ensure_nuscenes_map_layout(dataroot: str | Path) -> str:
+    root = Path(dataroot)
+    expected = root / "maps" / "expansion"
+    flat_expansion = root / "expansion"
+    if expected.exists() or not flat_expansion.exists():
+        return str(root)
+
+    expected.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        expected.symlink_to(flat_expansion, target_is_directory=True)
+    except OSError:
+        shutil.copytree(flat_expansion, expected, dirs_exist_ok=True)
+    return str(root)
+
+
 def build_v1_map_store(
     nusc,
     cfg: V1DataConfig | None = None,
@@ -297,8 +315,9 @@ def build_v1_map_store(
         map_names = sorted(names)
 
     store_by_name: dict[str, dict[str, list[Any]]] = {}
+    map_dataroot = _ensure_nuscenes_map_layout(nusc.dataroot)
     for map_name in map_names:
-        nusc_map = NuScenesMap(dataroot=nusc.dataroot, map_name=map_name)
+        nusc_map = NuScenesMap(dataroot=map_dataroot, map_name=map_name)
         polylines: list[_PolylineRecord] = []
         objects: list[_ObjectRecord] = []
 
