@@ -253,14 +253,13 @@ def _polyline_points_to_features(
     ).astype(np.float32, copy=False)
     resampled = _resample_polyline(local_points, max_points)
     num_points = resampled.shape[0]
-    midpoint = resampled[num_points // 2]
     tangent = np.zeros_like(resampled)
     tangent[1:-1] = 0.5 * (resampled[2:] - resampled[:-2])
     tangent[0] = resampled[1] - resampled[0]
     tangent[-1] = resampled[-1] - resampled[-2]
 
     point_features = np.zeros((num_points, 4), dtype=np.float32)
-    point_features[:, 0:2] = resampled - midpoint[None, :]
+    point_features[:, 0:2] = resampled
     point_features[:, 2:4] = tangent
     point_mask = np.ones((num_points,), dtype=np.bool_)
     return point_features, point_mask
