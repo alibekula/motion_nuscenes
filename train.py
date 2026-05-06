@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import random
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +51,12 @@ def _seed_everything(seed):
 def _positive_int_or_none(value):
     value = int(value)
     return value if value > 0 else None
+
+
+def _loss_cfg_for_epoch(base_cfg, epoch_idx, stage1_warmup_epochs):
+    if epoch_idx < int(stage1_warmup_epochs):
+        return replace(base_cfg, stage2_weight=0.0)
+    return base_cfg
 
 
 def train_one_epoch(
@@ -145,6 +152,9 @@ def main():
     parser.add_argument("--train-aug-prob", type=float, default=0.8)
     parser.add_argument("--train-max-rotation-deg", type=float, default=10.0)
     parser.add_argument("--train-translation-std-m", type=float, default=0.0)
+    parser.add_argument("--stage1-weight", type=float, default=0.5)
+    parser.add_argument("--stage2-weight", type=float, default=1.0)
+    parser.add_argument("--stage1-warmup-epochs", type=int, default=0)
     parser.add_argument("--cls-focal-gamma", type=float, default=1.5)
     parser.add_argument("--stationary-cls-weight", type=float, default=0.4)
     parser.add_argument("--soft-anchor-tau", type=float, default=0.2)
@@ -219,6 +229,8 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.eta_min)
     loss_cfg = V1LossConfig(
+        stage1_weight=args.stage1_weight,
+        stage2_weight=args.stage2_weight,
         cls_focal_gamma=args.cls_focal_gamma,
         stationary_cls_weight=args.stationary_cls_weight,
         soft_anchor_tau=args.soft_anchor_tau,
@@ -236,12 +248,13 @@ def main():
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(args.epochs):
+        train_loss_cfg = _loss_cfg_for_epoch(loss_cfg, epoch, args.stage1_warmup_epochs)
         train_metrics = train_one_epoch(
             model,
             train_loader,
             optimizer,
             device,
-            loss_cfg,
+            train_loss_cfg,
             scaler,
             grad_clip=args.grad_clip,
             use_amp=not args.disable_amp,
@@ -253,6 +266,7 @@ def main():
         print(
             f"Epoch {epoch + 1:02d}/{args.epochs} | "
             f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
+            f"S1/S2 weight: {train_loss_cfg.stage1_weight:.2f}/{train_loss_cfg.stage2_weight:.2f} | "
             f"Train top1 ADE: {train_metrics['stage2_top1_ade']:.4f} | "
             f"Val top1 ADE: {val_metrics['stage2_top1_ade']:.4f} | "
             f"Val top1 FDE: {val_metrics['stage2_top1_fde_l2']:.4f}"
