@@ -59,6 +59,11 @@ def _loss_cfg_for_epoch(base_cfg, epoch_idx, stage1_warmup_epochs):
     return base_cfg
 
 
+def _set_module_trainable(module, trainable):
+    for parameter in module.parameters():
+        parameter.requires_grad_(bool(trainable))
+
+
 def train_one_epoch(
     model,
     loader,
@@ -69,8 +74,11 @@ def train_one_epoch(
     grad_clip=1.0,
     use_amp=True,
     gt_cond_weight=0.0,
+    freeze_decoder1=False,
 ):
     model.train()
+    if freeze_decoder1:
+        model.decoder1.eval()
     running = {}
     n_batches = 0
     amp_enabled = bool(use_amp and device.type == "cuda")
@@ -155,6 +163,7 @@ def main():
     parser.add_argument("--stage1-weight", type=float, default=0.5)
     parser.add_argument("--stage2-weight", type=float, default=1.0)
     parser.add_argument("--stage1-warmup-epochs", type=int, default=0)
+    parser.add_argument("--freeze-decoder1-after-warmup", action="store_true")
     parser.add_argument("--cls-focal-gamma", type=float, default=1.5)
     parser.add_argument("--stationary-cls-weight", type=float, default=0.4)
     parser.add_argument("--soft-anchor-tau", type=float, default=0.2)
@@ -246,8 +255,19 @@ def main():
     best_val_top1_ade = float("inf")
     checkpoint_path = Path(args.checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    decoder1_frozen = False
 
     for epoch in range(args.epochs):
+        should_freeze_decoder1 = (
+            args.freeze_decoder1_after_warmup
+            and int(args.stage1_warmup_epochs) > 0
+            and epoch >= int(args.stage1_warmup_epochs)
+        )
+        if should_freeze_decoder1 and not decoder1_frozen:
+            _set_module_trainable(model.decoder1, False)
+            decoder1_frozen = True
+            print(f"Decoder1 frozen after {args.stage1_warmup_epochs} warmup epochs.")
+
         train_loss_cfg = _loss_cfg_for_epoch(loss_cfg, epoch, args.stage1_warmup_epochs)
         train_metrics = train_one_epoch(
             model,
@@ -259,6 +279,7 @@ def main():
             grad_clip=args.grad_clip,
             use_amp=not args.disable_amp,
             gt_cond_weight=args.gt_cond_weight,
+            freeze_decoder1=decoder1_frozen,
         )
         val_metrics = validate_one_epoch(model, val_loader, device, loss_cfg)
         scheduler.step()
@@ -267,6 +288,7 @@ def main():
             f"Epoch {epoch + 1:02d}/{args.epochs} | "
             f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
             f"S1/S2 weight: {train_loss_cfg.stage1_weight:.2f}/{train_loss_cfg.stage2_weight:.2f} | "
+            f"D1 frozen: {int(decoder1_frozen)} | "
             f"Train top1 ADE: {train_metrics['stage2_top1_ade']:.4f} | "
             f"Val top1 ADE: {val_metrics['stage2_top1_ade']:.4f} | "
             f"Val top1 FDE: {val_metrics['stage2_top1_fde_l2']:.4f}"
