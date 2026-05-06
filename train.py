@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import random
 from contextlib import nullcontext
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm.auto import tqdm
@@ -26,6 +29,22 @@ def move_batch_to_device(batch, device):
         else:
             out[key] = value
     return out
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def train_one_epoch(
@@ -73,7 +92,7 @@ def train_one_epoch(
         n_batches += 1
         pbar.set_postfix(
             loss=f"{running['total'] / n_batches:.4f}",
-            ade=f"{running['stage2_ade'] / n_batches:.4f}",
+            top1_ade=f"{running['stage2_top1_ade'] / n_batches:.4f}",
             lr=f"{metrics['lr']:.2e}",
         )
 
@@ -110,10 +129,19 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--disable-amp", action="store_true")
+    parser.add_argument("--seed", type=int, default=13)
     args = parser.parse_args()
+
+    _seed_everything(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    print(f"Seed: {args.seed}")
+
+    train_artifact_hash = _sha256_file(args.train_artifact)
+    val_artifact_hash = _sha256_file(args.val_artifact)
+    print(f"Train artifact SHA256: {train_artifact_hash}")
+    print(f"Val artifact SHA256: {val_artifact_hash}")
 
     train_aug = V1AugmentationConfig(
         enabled=True,
@@ -124,18 +152,24 @@ def main():
 
     train_dataset = V1ArtifactDataset(args.train_artifact, augmentation=train_aug)
     val_dataset = V1ArtifactDataset(args.val_artifact, augmentation=None)
+    train_generator = torch.Generator()
+    train_generator.manual_seed(int(args.seed))
+    val_generator = torch.Generator()
+    val_generator.manual_seed(int(args.seed) + 1)
 
     train_loader = build_v1_loader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
+        generator=train_generator,
     )
     val_loader = build_v1_loader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        generator=val_generator,
     )
 
     metadata = train_dataset.metadata
@@ -168,7 +202,7 @@ def main():
     )
 
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and not args.disable_amp))
-    best_val_ade = float("inf")
+    best_val_top1_ade = float("inf")
     checkpoint_path = Path(args.checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -189,13 +223,13 @@ def main():
         print(
             f"Epoch {epoch + 1:02d}/{args.epochs} | "
             f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
-            f"Train ADE: {train_metrics['stage2_ade']:.4f} | "
-            f"Val ADE: {val_metrics['stage2_ade']:.4f} | "
-            f"Val FDE: {val_metrics['stage2_fde_l2']:.4f}"
+            f"Train top1 ADE: {train_metrics['stage2_top1_ade']:.4f} | "
+            f"Val top1 ADE: {val_metrics['stage2_top1_ade']:.4f} | "
+            f"Val top1 FDE: {val_metrics['stage2_top1_fde_l2']:.4f}"
         )
 
-        if val_metrics["stage2_ade"] < best_val_ade:
-            best_val_ade = val_metrics["stage2_ade"]
+        if val_metrics["stage2_top1_ade"] < best_val_top1_ade:
+            best_val_top1_ade = val_metrics["stage2_top1_ade"]
             torch.save(
                 {
                     "epoch": epoch + 1,
@@ -203,7 +237,12 @@ def main():
                     "optimizer_state_dict": optimizer.state_dict(),
                     "model_cfg": model_cfg,
                     "loss_cfg": loss_cfg,
-                    "best_val_ade": best_val_ade,
+                    "best_val_top1_ade": best_val_top1_ade,
+                    "seed": int(args.seed),
+                    "train_artifact_path": str(Path(args.train_artifact).resolve()),
+                    "val_artifact_path": str(Path(args.val_artifact).resolve()),
+                    "train_artifact_sha256": train_artifact_hash,
+                    "val_artifact_sha256": val_artifact_hash,
                 },
                 checkpoint_path,
             )

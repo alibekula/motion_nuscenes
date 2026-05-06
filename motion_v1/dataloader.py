@@ -15,6 +15,9 @@ from motion_v1.categories import AGENT_CLASS_NAMES, EGO_CLASS_NAME, normalize_mo
 from motion_v1.geometry import global_xy_to_ego, quaternion_yaw, wrap_angle
 
 
+CURRENT_ARTIFACT_SEMANTIC_VERSION = 2
+
+
 @dataclass(frozen=True)
 class V1DataConfig:
     history_frames: int = 4
@@ -31,7 +34,7 @@ class V1DataConfig:
     polyline_attr_dim: int = 8
     object_feature_dim: int = 10
     anchor_k12: int = 64
-    anchor_knn: int = 64
+    anchor_kmeans_iters: int = 25
     anchor_random_seed: int = 13
     anchor_stationary_threshold_m: float = 0.5
 
@@ -54,6 +57,7 @@ class V1ArtifactMetadata:
     polyline_point_dim: int
     polyline_attr_dim: int
     object_feature_dim: int
+    artifact_semantic_version: int = CURRENT_ARTIFACT_SEMANTIC_VERSION
 
 
 @dataclass(frozen=True)
@@ -144,7 +148,7 @@ def _apply_scene_augmentation(sample: dict[str, Any], cfg: V1AugmentationConfig 
     augmented["future_positions_ego"] = future_positions_ego
 
     polyline_point_features = sample["polyline_point_features"].clone()
-    polyline_point_features[..., 0:2] = polyline_point_features[..., 0:2] @ rotation
+    polyline_point_features[..., 0:2] = polyline_point_features[..., 0:2] @ rotation + translation.view(1, 1, 2)
     polyline_point_features[..., 2:4] = polyline_point_features[..., 2:4] @ rotation
     augmented["polyline_point_features"] = polyline_point_features
 
@@ -559,10 +563,15 @@ class V1WindowDataset(Dataset):
         )
 
         for instance_token, current_state in self.scene_agent_frames[scene_token][hist_end_idx].items():
-            track = [
-                self.scene_agent_frames[scene_token][frame_idx][instance_token]
-                for frame_idx in range(start_idx, fut_end)
-            ]
+            track: list[dict[str, Any]] = []
+            for frame_idx in range(start_idx, fut_end):
+                state = self.scene_agent_frames[scene_token][frame_idx].get(instance_token)
+                if state is None:
+                    track = []
+                    break
+                track.append(state)
+            if not track:
+                continue
             agents.append(
                 self._build_agent_entry(
                     agent_token=instance_token,
@@ -703,7 +712,7 @@ class V1WindowDataset(Dataset):
             "samples": samples,
         }
         if build_anchor_bank:
-            payload["anchor_bank"] = build_anchor_bank_knn_mean(samples, self.cfg)
+            payload["anchor_bank"] = build_anchor_bank_kmeans(samples, self.cfg)
         _validate_artifact_payload(payload)
         return payload
 
@@ -730,6 +739,13 @@ def _validate_artifact_payload(payload: dict[str, Any]) -> None:
 
     metadata = payload["metadata"]
     samples = payload["samples"]
+    semantic_version = int(metadata.get("artifact_semantic_version", 1))
+    if semantic_version != CURRENT_ARTIFACT_SEMANTIC_VERSION:
+        raise ValueError(
+            "Artifact semantic version "
+            f"{semantic_version} is incompatible with current loader version "
+            f"{CURRENT_ARTIFACT_SEMANTIC_VERSION}. Rebuild artifacts because polyline point xy semantics changed."
+        )
 
     history_frames = int(metadata["history_frames"])
     future_frames = int(metadata["future_frames"])
@@ -769,6 +785,8 @@ def _validate_artifact_payload(payload: dict[str, Any]) -> None:
     anchor_bank = payload.get("anchor_bank")
     if anchor_bank is None:
         return
+    if anchor_bank.get("method") != "kmeans":
+        raise ValueError("Artifact anchor bank must be built with method='kmeans'. Rebuild artifacts.")
     if anchor_bank["full_bank"].ndim != 3 or anchor_bank["full_bank"].shape[-1] != 2:
         raise ValueError("Anchor bank full_bank must have shape [K, T, 2].")
     if anchor_bank["prefix_bank"].ndim != 3 or anchor_bank["prefix_bank"].shape[-1] != 2:
@@ -825,6 +843,37 @@ def _normalize_profile(profile: np.ndarray) -> np.ndarray:
     return (profile / np.maximum(norm, 1e-6)).astype(np.float32, copy=False)
 
 
+def _profile_assignment_distance(flat: np.ndarray, centers: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    distance = ((flat[:, None, :] - centers[None, :, :]) ** 2).sum(axis=-1)
+    assignments = distance.argmin(axis=1)
+    closest = distance[np.arange(distance.shape[0]), assignments]
+    return assignments.astype(np.int64, copy=False), closest.astype(np.float32, copy=False)
+
+
+def _init_kmeans_plus_plus(flat: np.ndarray, num_centers: int, rng: np.random.Generator) -> np.ndarray:
+    first_idx = int(rng.integers(0, flat.shape[0]))
+    center_indices = [first_idx]
+    closest = ((flat - flat[first_idx : first_idx + 1]) ** 2).sum(axis=-1)
+
+    while len(center_indices) < num_centers:
+        total = float(closest.sum())
+        if total <= 1e-12:
+            unused = np.setdiff1d(np.arange(flat.shape[0]), np.asarray(center_indices), assume_unique=False)
+            if unused.size == 0:
+                next_idx = int(rng.integers(0, flat.shape[0]))
+            else:
+                next_idx = int(rng.choice(unused))
+        else:
+            threshold = float(rng.random() * total)
+            next_idx = int(np.searchsorted(np.cumsum(closest), threshold, side="right"))
+            next_idx = min(next_idx, flat.shape[0] - 1)
+        center_indices.append(next_idx)
+        next_distance = ((flat - flat[next_idx : next_idx + 1]) ** 2).sum(axis=-1)
+        closest = np.minimum(closest, next_distance)
+
+    return np.asarray(center_indices, dtype=np.int64)
+
+
 def _compute_r_max(
     future_local: np.ndarray,
     assignments: np.ndarray,
@@ -844,7 +893,7 @@ def _compute_r_max(
     return float(max(np.percentile(residual_abs, 95.0), 1e-3))
 
 
-def build_anchor_bank_knn_mean(samples: list[dict[str, Any]], cfg: V1DataConfig) -> dict[str, Any]:
+def build_anchor_bank_kmeans(samples: list[dict[str, Any]], cfg: V1DataConfig) -> dict[str, Any]:
     profiles: list[np.ndarray] = []
     future_local_list: list[np.ndarray] = []
 
@@ -866,30 +915,61 @@ def build_anchor_bank_knn_mean(samples: list[dict[str, Any]], cfg: V1DataConfig)
 
     rng = np.random.default_rng(cfg.anchor_random_seed)
     num_anchors = min(cfg.anchor_k12, flat.shape[0])
-    seed_idx = rng.choice(flat.shape[0], size=num_anchors, replace=False)
-    knn = min(cfg.anchor_knn, flat.shape[0])
+    center_idx = _init_kmeans_plus_plus(flat, num_anchors, rng)
+    centers = profile_array[center_idx].copy()
+    empty_replacements = 0
+    actual_iterations = 0
 
-    anchors = []
-    for idx in seed_idx:
-        distance = ((flat - flat[idx : idx + 1]) ** 2).sum(axis=-1)
-        nn_idx = np.argpartition(distance, kth=knn - 1)[:knn]
-        mean_profile = profile_array[nn_idx].mean(axis=0)
-        anchors.append(_normalize_profile(mean_profile))
+    for iteration in range(max(int(cfg.anchor_kmeans_iters), 1)):
+        actual_iterations = iteration + 1
+        center_flat = centers.reshape(num_anchors, -1)
+        assignments, closest = _profile_assignment_distance(flat, center_flat)
+        next_centers = np.empty_like(centers)
+        changed = False
+        fallback_order = np.argsort(closest)[::-1]
+        fallback_cursor = 0
+        used_fallback: set[int] = set()
 
-    full_bank = np.stack(anchors, axis=0).astype(np.float32, copy=False)
+        for anchor_idx in range(num_anchors):
+            member_mask = assignments == anchor_idx
+            if np.any(member_mask):
+                next_centers[anchor_idx] = _normalize_profile(profile_array[member_mask].mean(axis=0))
+                continue
+
+            while fallback_cursor < fallback_order.shape[0] and int(fallback_order[fallback_cursor]) in used_fallback:
+                fallback_cursor += 1
+            fallback_idx = int(fallback_order[min(fallback_cursor, fallback_order.shape[0] - 1)])
+            used_fallback.add(fallback_idx)
+            empty_replacements += 1
+            changed = True
+            next_centers[anchor_idx] = profile_array[fallback_idx]
+
+        if np.allclose(centers, next_centers, atol=1e-6) and not changed:
+            centers = next_centers
+            break
+        centers = next_centers
+
+    full_bank = centers.astype(np.float32, copy=False)
     prefix_flat = np.round(full_bank[:, :6, :].reshape(full_bank.shape[0], -1), decimals=6)
     _, unique_idx = np.unique(prefix_flat, axis=0, return_index=True)
     prefix_bank = full_bank[np.sort(unique_idx), :6, :].astype(np.float32, copy=False)
 
-    distance = ((flat[:, None, :] - full_bank.reshape(full_bank.shape[0], -1)[None, :, :]) ** 2).sum(axis=-1)
-    assignments = distance.argmin(axis=1)
+    assignments, closest = _profile_assignment_distance(flat, full_bank.reshape(full_bank.shape[0], -1))
     r_max = _compute_r_max(future_local_array, assignments, full_bank)
+    assignment_distance = np.sqrt(closest)
 
     return {
         "full_bank": full_bank,
         "prefix_bank": prefix_bank,
         "r_max": float(r_max),
+        "method": "kmeans",
         "num_profiles": int(profile_array.shape[0]),
+        "num_anchors": int(full_bank.shape[0]),
+        "num_iterations": int(actual_iterations),
+        "empty_cluster_replacements": int(empty_replacements),
+        "mean_assignment_distance": float(assignment_distance.mean()),
+        "max_assignment_distance": float(assignment_distance.max()),
+        "seed": int(cfg.anchor_random_seed),
     }
 
 
@@ -963,6 +1043,7 @@ def build_v1_loader(
     shuffle: bool,
     num_workers: int = 4,
     pin_memory: bool = True,
+    generator: torch.Generator | None = None,
 ) -> DataLoader:
     kwargs: dict[str, Any] = {
         "dataset": dataset,
@@ -972,6 +1053,7 @@ def build_v1_loader(
         "pin_memory": pin_memory,
         "collate_fn": collate_v1_batch,
         "persistent_workers": num_workers > 0,
+        "generator": generator,
     }
     if num_workers > 0:
         kwargs["prefetch_factor"] = 2

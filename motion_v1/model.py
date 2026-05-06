@@ -16,6 +16,14 @@ def _mlp(input_dim: int, hidden_dim: int, output_dim: int) -> nn.Sequential:
     )
 
 
+def _zero_last_linear(module: nn.Module) -> None:
+    for layer in reversed(list(module.modules())):
+        if isinstance(layer, nn.Linear):
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
+            return
+
+
 def _inv_softplus(x: torch.Tensor) -> torch.Tensor:
     return torch.where(x > 20.0, x, torch.log(torch.expm1(x.clamp_min(1e-6))))
 
@@ -56,6 +64,9 @@ class V1ModelConfig:
     polyline_point_dim: int = 4
     polyline_attr_dim: int = 8
     object_feature_dim: int = 10
+    use_pose_encoding: bool = True
+    use_relative_encoding: bool = True
+    pose_radius_m: float = 80.0
 
     @property
     def motion_summary_dim(self) -> int:
@@ -207,6 +218,53 @@ class MapEncoder(nn.Module):
         return polyline_tokens, object_tokens
 
 
+class SceneEncoderLayer(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        ff_mult: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=int(hidden_dim),
+            num_heads=int(num_heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.linear1 = nn.Linear(int(hidden_dim), int(hidden_dim) * int(ff_mult))
+        self.linear2 = nn.Linear(int(hidden_dim) * int(ff_mult), int(hidden_dim))
+        self.norm1 = nn.LayerNorm(int(hidden_dim))
+        self.norm2 = nn.LayerNorm(int(hidden_dim))
+        self.dropout = nn.Dropout(float(dropout))
+        self.dropout1 = nn.Dropout(float(dropout))
+        self.dropout2 = nn.Dropout(float(dropout))
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        pad_mask: torch.Tensor,
+        attention_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        attn_mask = None
+        if attention_bias is not None:
+            batch_size, num_heads, seq_len, _ = attention_bias.shape
+            attn_mask = attention_bias.reshape(batch_size * num_heads, seq_len, seq_len)
+
+        attended = self.self_attn(
+            tokens,
+            tokens,
+            tokens,
+            attn_mask=attn_mask,
+            key_padding_mask=pad_mask,
+            need_weights=False,
+        )[0]
+        tokens = self.norm1(tokens + self.dropout1(attended))
+        ff = self.linear2(self.dropout(F.gelu(self.linear1(tokens))))
+        return self.norm2(tokens + self.dropout2(ff))
+
+
 class SceneEncoder(nn.Module):
     def __init__(
         self,
@@ -215,31 +273,44 @@ class SceneEncoder(nn.Module):
         num_layers: int = 2,
         ff_mult: int = 4,
         dropout: float = 0.1,
+        use_pose_encoding: bool = True,
+        use_relative_encoding: bool = True,
+        pose_radius_m: float = 80.0,
     ) -> None:
         super().__init__()
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=int(hidden_dim),
-            nhead=int(num_heads),
-            dim_feedforward=int(hidden_dim) * int(ff_mult),
-            dropout=float(dropout),
-            activation="gelu",
-            batch_first=True,
+        self.num_heads = int(num_heads)
+        self.use_pose_encoding = bool(use_pose_encoding)
+        self.use_relative_encoding = bool(use_relative_encoding)
+        self.pose_radius_m = float(pose_radius_m)
+        self.layers = nn.ModuleList(
+            [
+                SceneEncoderLayer(
+                    hidden_dim=hidden_dim,
+                    num_heads=num_heads,
+                    ff_mult=ff_mult,
+                    dropout=dropout,
+                )
+                for _ in range(int(num_layers))
+            ]
         )
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer=encoder_layer,
-            num_layers=int(num_layers),
-            norm=nn.LayerNorm(int(hidden_dim)),
-        )
+        self.norm = nn.LayerNorm(int(hidden_dim))
         self.type_embedding = nn.Embedding(3, int(hidden_dim))
+        self.pose_embedding = _mlp(4, int(hidden_dim), int(hidden_dim))
+        self.relative_bias_mlp = _mlp(7, int(hidden_dim), int(num_heads))
+        _zero_last_linear(self.pose_embedding)
+        _zero_last_linear(self.relative_bias_mlp)
 
     def forward(
         self,
         agent_tokens: torch.Tensor,
         agent_pad_mask: torch.Tensor,
+        agent_poses: torch.Tensor | None = None,
         polyline_tokens: torch.Tensor | None = None,
         polyline_pad_mask: torch.Tensor | None = None,
+        polyline_poses: torch.Tensor | None = None,
         object_tokens: torch.Tensor | None = None,
         object_pad_mask: torch.Tensor | None = None,
+        object_poses: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if agent_tokens.ndim != 3:
             raise ValueError("Expected agent_tokens with shape [B, A, H].")
@@ -251,27 +322,46 @@ class SceneEncoder(nn.Module):
         object_tokens = self._default_optional_tokens(agent_tokens, object_tokens)
         polyline_pad_mask = self._default_optional_mask(batch_size, polyline_tokens, polyline_pad_mask, agent_tokens.device)
         object_pad_mask = self._default_optional_mask(batch_size, object_tokens, object_pad_mask, agent_tokens.device)
+        agent_poses = self._default_optional_poses(batch_size, num_agents, agent_poses, agent_tokens.device, agent_tokens.dtype)
+        polyline_poses = self._default_optional_poses(
+            batch_size,
+            polyline_tokens.shape[1],
+            polyline_poses,
+            agent_tokens.device,
+            agent_tokens.dtype,
+        )
+        object_poses = self._default_optional_poses(
+            batch_size,
+            object_tokens.shape[1],
+            object_poses,
+            agent_tokens.device,
+            agent_tokens.dtype,
+        )
         agent_pad_mask = agent_pad_mask.to(device=agent_tokens.device, dtype=torch.bool)
 
         token_groups = []
         mask_groups = []
         type_groups = []
+        pose_groups = []
 
         if num_agents > 0:
             token_groups.append(agent_tokens)
             mask_groups.append(agent_pad_mask)
+            pose_groups.append(agent_poses)
             type_groups.append(
                 self.type_embedding(torch.zeros((batch_size, num_agents), dtype=torch.long, device=agent_tokens.device))
             )
         if polyline_tokens.shape[1] > 0:
             token_groups.append(polyline_tokens)
             mask_groups.append(polyline_pad_mask)
+            pose_groups.append(polyline_poses)
             type_groups.append(
                 self.type_embedding(torch.ones((batch_size, polyline_tokens.shape[1]), dtype=torch.long, device=agent_tokens.device))
             )
         if object_tokens.shape[1] > 0:
             token_groups.append(object_tokens)
             mask_groups.append(object_pad_mask)
+            pose_groups.append(object_poses)
             type_groups.append(
                 self.type_embedding(torch.full((batch_size, object_tokens.shape[1]), 2, dtype=torch.long, device=agent_tokens.device))
             )
@@ -279,7 +369,10 @@ class SceneEncoder(nn.Module):
         if not token_groups:
             return agent_tokens.new_zeros((batch_size, num_agents, hidden_dim))
 
+        poses = torch.cat(pose_groups, dim=1)
         tokens = torch.cat(token_groups, dim=1) + torch.cat(type_groups, dim=1)
+        if self.use_pose_encoding:
+            tokens = tokens + self._pose_embedding(poses)
         pad_mask = torch.cat(mask_groups, dim=1)
 
         safe_pad_mask = pad_mask.clone()
@@ -287,7 +380,11 @@ class SceneEncoder(nn.Module):
         if torch.any(fully_padded_rows):
             safe_pad_mask[fully_padded_rows, 0] = False
 
-        encoded = self.encoder(tokens, src_key_padding_mask=safe_pad_mask)
+        attention_bias = self._relative_attention_bias(poses) if self.use_relative_encoding else None
+        encoded = tokens
+        for layer in self.layers:
+            encoded = layer(encoded, pad_mask=safe_pad_mask, attention_bias=attention_bias)
+        encoded = self.norm(encoded)
         encoded = encoded.masked_fill(pad_mask.unsqueeze(-1), 0.0)
         return encoded[:, :num_agents]
 
@@ -306,6 +403,52 @@ class SceneEncoder(nn.Module):
         if maybe_mask is not None:
             return maybe_mask.to(device=device, dtype=torch.bool)
         return torch.ones((batch_size, tokens.shape[1]), dtype=torch.bool, device=device)
+
+    def _default_optional_poses(
+        self,
+        batch_size: int,
+        num_tokens: int,
+        maybe_poses: torch.Tensor | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if maybe_poses is not None:
+            return maybe_poses.to(device=device, dtype=dtype)
+        poses = torch.zeros((batch_size, num_tokens, 4), dtype=dtype, device=device)
+        poses[..., 2] = 1.0
+        return poses
+
+    def _pose_embedding(self, poses: torch.Tensor) -> torch.Tensor:
+        pose_features = poses.clone()
+        pose_features[..., 0:2] = (pose_features[..., 0:2] / max(self.pose_radius_m, 1e-6)).clamp(-2.0, 2.0)
+        return self.pose_embedding(pose_features)
+
+    def _relative_attention_bias(self, poses: torch.Tensor) -> torch.Tensor:
+        xy = poses[..., 0:2]
+        cos_yaw = poses[..., 2]
+        sin_yaw = poses[..., 3]
+        delta = xy.unsqueeze(1) - xy.unsqueeze(2)
+        scaled_delta = (delta / max(self.pose_radius_m, 1e-6)).clamp(-2.0, 2.0)
+        distance = torch.linalg.norm(scaled_delta, dim=-1, keepdim=True).clamp(max=2.0)
+
+        query_cos = cos_yaw.unsqueeze(2)
+        query_sin = sin_yaw.unsqueeze(2)
+        local_dx = scaled_delta[..., 0] * query_cos + scaled_delta[..., 1] * query_sin
+        local_dy = -scaled_delta[..., 0] * query_sin + scaled_delta[..., 1] * query_cos
+        relative_cos = cos_yaw.unsqueeze(1) * cos_yaw.unsqueeze(2) + sin_yaw.unsqueeze(1) * sin_yaw.unsqueeze(2)
+        relative_sin = sin_yaw.unsqueeze(1) * cos_yaw.unsqueeze(2) - cos_yaw.unsqueeze(1) * sin_yaw.unsqueeze(2)
+
+        features = torch.cat(
+            [
+                scaled_delta,
+                torch.stack([local_dx, local_dy], dim=-1),
+                distance,
+                relative_cos.unsqueeze(-1),
+                relative_sin.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        return self.relative_bias_mlp(features).permute(0, 3, 1, 2).contiguous()
 
 
 class AnchorDecoder(nn.Module):
@@ -450,6 +593,9 @@ class V1MotionModel(nn.Module):
             num_layers=cfg.tf_layers,
             ff_mult=cfg.ff_mult,
             dropout=cfg.dropout,
+            use_pose_encoding=cfg.use_pose_encoding,
+            use_relative_encoding=cfg.use_relative_encoding,
+            pose_radius_m=cfg.pose_radius_m,
         )
         self.decoder1 = AnchorDecoder(
             cfg.hidden_dim,
@@ -497,13 +643,19 @@ class V1MotionModel(nn.Module):
             polyline_pad_mask=batch["polyline_pad_mask"],
             object_pad_mask=batch["object_pad_mask"],
         )
+        agent_poses = self._agent_token_poses(history_features)
+        polyline_poses = self._polyline_token_poses(batch["polyline_point_features"], batch["polyline_point_mask"])
+        object_poses = self._object_token_poses(batch["object_features"])
         scene_agent_tokens = self.scene_encoder(
             agent_tokens=agent_tokens,
             agent_pad_mask=agent_pad_mask,
+            agent_poses=agent_poses,
             polyline_tokens=polyline_tokens,
             polyline_pad_mask=batch["polyline_pad_mask"],
+            polyline_poses=polyline_poses,
             object_tokens=object_tokens,
             object_pad_mask=batch["object_pad_mask"],
+            object_poses=object_poses,
         )
 
         score6, traj6, ds6, z6_dir, z6_stat = self.decoder1(
@@ -550,6 +702,9 @@ class V1MotionModel(nn.Module):
             "agent_tokens": agent_tokens,
             "polyline_tokens": polyline_tokens,
             "object_tokens": object_tokens,
+            "agent_poses": agent_poses,
+            "polyline_poses": polyline_poses,
+            "object_poses": object_poses,
             "scene_agent_tokens": scene_agent_tokens,
             "conditioning_features": conditioning,
             "conditioned_agent_tokens": conditioned_agent_tokens,
@@ -576,6 +731,30 @@ class V1MotionModel(nn.Module):
 
         summaries = torch.stack([v_last, v_mean, a_long, yaw_rate_mean], dim=-1)
         return summaries, v_last
+
+    def _agent_token_poses(self, history_features: torch.Tensor) -> torch.Tensor:
+        last = history_features[:, :, -1]
+        return torch.cat([last[..., 0:2], last[..., 2:4]], dim=-1)
+
+    def _polyline_token_poses(
+        self,
+        polyline_point_features: torch.Tensor,
+        polyline_point_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        point_mask = polyline_point_mask.to(device=polyline_point_features.device, dtype=polyline_point_features.dtype)
+        denom = point_mask.sum(dim=2, keepdim=True).clamp_min(1.0)
+        xy = (polyline_point_features[..., 0:2] * point_mask.unsqueeze(-1)).sum(dim=2) / denom
+        tangent = (polyline_point_features[..., 2:4] * point_mask.unsqueeze(-1)).sum(dim=2)
+        tangent_norm = tangent.norm(dim=-1, keepdim=True)
+        default_dir = torch.zeros_like(tangent)
+        default_dir[..., 0] = 1.0
+        direction = torch.where(tangent_norm > 1e-6, tangent / tangent_norm.clamp_min(1e-6), default_dir)
+        return torch.cat([xy, direction], dim=-1)
+
+    def _object_token_poses(self, object_features: torch.Tensor) -> torch.Tensor:
+        if object_features.shape[1] == 0:
+            return object_features.new_zeros((object_features.shape[0], 0, 4))
+        return object_features[..., 0:4]
 
     def _conditioning(
         self,
@@ -830,14 +1009,14 @@ def compute_v1_losses(
         "stage1_pos": float(stage1_terms["pos"].item()),
         "stage1_fde": float(stage1_terms["fde"].item()),
         "stage1_smooth": float(stage1_terms["smooth"].item()),
-        "stage1_ade": stage1_metrics["ade"],
-        "stage1_fde_l2": stage1_metrics["fde_l2"],
+        "stage1_top1_ade": stage1_metrics["top1_ade"],
+        "stage1_top1_fde_l2": stage1_metrics["top1_fde_l2"],
         "stage2_cls": float(stage2_terms["cls"].item()),
         "stage2_pos": float(stage2_terms["pos"].item()),
         "stage2_fde": float(stage2_terms["fde"].item()),
         "stage2_smooth": float(stage2_terms["smooth"].item()),
-        "stage2_ade": stage2_metrics["ade"],
-        "stage2_fde_l2": stage2_metrics["fde_l2"],
+        "stage2_top1_ade": stage2_metrics["top1_ade"],
+        "stage2_top1_fde_l2": stage2_metrics["top1_fde_l2"],
         "total": float(total_loss.item()),
     }
     return total_loss, metrics
@@ -993,7 +1172,7 @@ def _weighted_regression_loss(
         per_item = per_item.mean(dim=reduce_dims)
 
     valid_weight = weight * valid_agent_mask.to(dtype=weight.dtype)
-    normalizer = valid_agent_mask.to(dtype=weight.dtype).sum().clamp_min(1.0)
+    normalizer = valid_weight.sum().clamp_min(1e-6)
     return (per_item * valid_weight).sum() / normalizer
 
 
@@ -1005,9 +1184,9 @@ def _compute_prediction_metrics(
     horizon = prediction.shape[-2]
     target = gt_future_local[..., :horizon, :]
     if not torch.any(valid_agent_mask):
-        return {"ade": 0.0, "fde_l2": 0.0}
+        return {"top1_ade": 0.0, "top1_fde_l2": 0.0}
 
     l2 = torch.linalg.norm(prediction - target, dim=-1)
     ade = float(l2[valid_agent_mask].mean().item())
     fde = float(torch.linalg.norm(prediction[..., -1, :] - target[..., -1, :], dim=-1)[valid_agent_mask].mean().item())
-    return {"ade": ade, "fde_l2": fde}
+    return {"top1_ade": ade, "top1_fde_l2": fde}

@@ -12,8 +12,8 @@
 
 | Metric | Value |
 |--------|-------|
-| val ADE | 1.4193 |
-| val FDE | 3.2450 |
+| val top1 ADE | 1.4193 |
+| val top1 FDE | 3.2450 |
 
 Лучший результат относится к финальной V1-конфигурации с artifact payload и anchor-based routing.
 
@@ -62,7 +62,7 @@ flowchart TD
 3. `Map store`
    Строится один раз на уровень `map_name`; lane/connector/divider геометрия векторизуется заранее, а локальный контекст сцены выбирается вокруг ego-позиции.
 4. `Anchor bank`
-   Строится по agent-local directional profiles и используется как routing-пространство для мультимодального предсказания.
+   Строится k-means++/k-means по agent-local directional profiles и используется как routing-пространство для мультимодального предсказания.
 5. `Artifacts`
    Сохраняются на диск, после чего train loader в основном только читает, паддит и возвращает готовые тензоры.
 
@@ -73,6 +73,7 @@ flowchart TD
     A["padded scene batch"] --> B["HistoryEncoder"]
     A --> C["motion summaries"]
     A --> D["MapEncoder"]
+    A --> Q["token poses"]
 
     B --> E["history tokens"]
     C --> F["agent tokens"]
@@ -81,9 +82,10 @@ flowchart TD
     D --> G["polyline tokens"]
     D --> H["object tokens"]
 
-    F --> I["SceneEncoder"]
+    F --> I["SceneEncoder with pose embeddings and relative bias"]
     G --> I
     H --> I
+    Q --> I
 
     I --> J["scene agent tokens"]
     J --> K["AnchorDecoder stage1 / A6"]
@@ -113,7 +115,7 @@ flowchart TD
 
 ## Key Ablations
 
-| Setting | val ADE |
+| Setting | val top1 ADE |
 |---------|---------|
 | hard WTA | 1.4378 |
 | predicted_topk=6 | 1.4262 |
