@@ -81,7 +81,14 @@ def _plot_trajectory(ax, xy: np.ndarray, *, color: str, label: str, linewidth: f
     ax.scatter(xy[-1:, 0], xy[-1:, 1], color=color, s=18, alpha=alpha, zorder=zorder + 1)
 
 
-def _plot_full_scene(ax, sample: dict[str, Any], all_local: torch.Tensor, logits: torch.Tensor, max_agents: int) -> None:
+def _plot_full_scene(
+    ax,
+    sample: dict[str, Any],
+    all_local: torch.Tensor,
+    logits: torch.Tensor,
+    max_agents: int,
+    include_ego: bool,
+) -> None:
     history_all = sample["history_features"].numpy()
     future_all = sample["future_positions_ego"].numpy()
     tokens = list(sample["agent_tokens"])
@@ -90,38 +97,51 @@ def _plot_full_scene(ax, sample: dict[str, Any], all_local: torch.Tensor, logits
         displacement = np.linalg.norm(future_all[agent_indices, -1, 0:2] - history_all[agent_indices, -1, 0:2], axis=-1)
         order = np.argsort(displacement)[::-1][:max_agents]
         agent_indices = [agent_indices[int(idx)] for idx in order]
+    if include_ego:
+        agent_indices = [0] + agent_indices
 
     for plot_idx, agent_idx in enumerate(agent_indices):
         pred = _top1_prediction_ego(all_local, logits, history_all, agent_idx)
         show_labels = plot_idx == 0
+        is_ego = agent_idx == 0
+        history_color = "#2F6FED" if is_ego else "#20242A"
+        gt_color = "#00A7A7" if is_ego else "#18A058"
+        pred_color = "#7B2CBF" if is_ego else "#D7263D"
         ax.plot(
             history_all[agent_idx, :, 0],
             history_all[agent_idx, :, 1],
-            color="#20242A",
-            linewidth=1.2,
-            alpha=0.55,
-            label="agent history" if show_labels else None,
-            zorder=4,
+            color=history_color,
+            linewidth=2.0 if is_ego else 1.2,
+            alpha=0.85 if is_ego else 0.55,
+            label="ego history" if is_ego else ("agent history" if show_labels else None),
+            zorder=7 if is_ego else 4,
         )
         ax.plot(
             future_all[agent_idx, :, 0],
             future_all[agent_idx, :, 1],
-            color="#18A058",
-            linewidth=1.5,
-            alpha=0.65,
-            label="ground truth" if show_labels else None,
-            zorder=5,
+            color=gt_color,
+            linewidth=2.3 if is_ego else 1.5,
+            alpha=0.95 if is_ego else 0.65,
+            label="ego ground truth" if is_ego else ("ground truth" if show_labels else None),
+            zorder=8 if is_ego else 5,
         )
         ax.plot(
             pred[:, 0],
             pred[:, 1],
-            color="#D7263D",
-            linewidth=1.5,
-            alpha=0.65,
-            label="top1 prediction" if show_labels else None,
-            zorder=6,
+            color=pred_color,
+            linewidth=2.3 if is_ego else 1.5,
+            alpha=0.95 if is_ego else 0.65,
+            label="ego top1 prediction" if is_ego else ("top1 prediction" if show_labels else None),
+            zorder=9 if is_ego else 6,
         )
-        ax.scatter(history_all[agent_idx, -1, 0], history_all[agent_idx, -1, 1], s=13, color="#20242A", alpha=0.65, zorder=7)
+        ax.scatter(
+            history_all[agent_idx, -1, 0],
+            history_all[agent_idx, -1, 1],
+            s=32 if is_ego else 13,
+            color=history_color,
+            alpha=0.85 if is_ego else 0.65,
+            zorder=10 if is_ego else 7,
+        )
 
 
 def main() -> None:
@@ -133,6 +153,7 @@ def main() -> None:
     parser.add_argument("--agent-index", type=int, default=None)
     parser.add_argument("--agent-token", type=str, default=None)
     parser.add_argument("--all-agents", action="store_true", help="Render top1 predictions for all non-ego agents.")
+    parser.add_argument("--include-ego", action="store_true", help="Include ego future and top1 prediction in full-scene mode.")
     parser.add_argument("--max-agents", type=int, default=48, help="Limit full-scene rendering to most-moving agents. Use 0 for all.")
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -183,14 +204,23 @@ def main() -> None:
     _plot_polylines(ax, sample)
     _plot_objects(ax, sample)
 
-    ego_history = sample["history_features"][0].numpy()[:, 0:2]
-    ax.plot(ego_history[:, 0], ego_history[:, 1], color="#2F6FED", linewidth=1.6, alpha=0.75, label="ego history", zorder=4)
+    if not (args.all_agents and args.include_ego):
+        ego_history = sample["history_features"][0].numpy()[:, 0:2]
+        ax.plot(ego_history[:, 0], ego_history[:, 1], color="#2F6FED", linewidth=1.6, alpha=0.75, label="ego history", zorder=4)
 
     token = sample["agent_tokens"][agent_idx]
     mode_text = ", ".join(f"{int(idx)}:{prob:.2f}" for idx, prob in zip(top_idx_np, top_prob_np, strict=False))
     if args.all_agents:
-        _plot_full_scene(ax, sample, all_local_all, logits_all, max_agents=int(args.max_agents))
-        title = f"sample {args.sample_index} | full scene top1 predictions | agents={len(sample['agent_tokens']) - 1}"
+        _plot_full_scene(
+            ax,
+            sample,
+            all_local_all,
+            logits_all,
+            max_agents=int(args.max_agents),
+            include_ego=bool(args.include_ego),
+        )
+        ego_note = " + ego" if args.include_ego else ""
+        title = f"sample {args.sample_index} | full scene top1 predictions{ego_note} | agents={len(sample['agent_tokens']) - 1}"
     else:
         _plot_trajectory(ax, history[:, 0:2], color="#20242A", label="agent history", linewidth=2.2, alpha=1.0, zorder=6)
         _plot_trajectory(ax, future[:, 0:2], color="#18A058", label="ground truth", linewidth=2.4, alpha=0.95, zorder=7)
