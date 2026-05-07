@@ -1,4 +1,4 @@
-# motion_prediction_v1
+# motion_prediction
 
 Сценовый baseline для multi-agent motion prediction на `nuScenes`.
 
