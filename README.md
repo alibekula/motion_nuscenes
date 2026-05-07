@@ -6,21 +6,6 @@
 
 Один sample соответствует scene window с reference keyframe. Все агенты, объекты карты и полилинии приводятся к ego-frame этого reference frame. Модель предсказывает 12 future steps (`6` секунд, `dt=0.5`) для каждого агента через двухэтапный anchor-based decoder.
 
-## Финальная Конфигурация
-
-| Параметр | Значение |
-|----------|----------|
-| batch size | 128 |
-| lr | 3e-4 |
-| dropout | 0.1 |
-| stage1 weight | 0.5 |
-| stage2 weight | 1.0 |
-| train augmentation prob | 0.9 |
-| rotation | 10 deg |
-| translation | 0.5 m |
-| history xy noise | 0.03 m |
-| history yaw noise | 1.0 deg |
-
 ## Результаты
 
 Основная validation-метрика из training loop:
@@ -117,6 +102,22 @@ motion_nuscenes/
 ├── train.py
 └── README.md
 ```
+
+## Финальная Конфигурация
+
+| Параметр | Значение |
+|----------|----------|
+| batch size | 128 |
+| lr | 3e-4 |
+| dropout | 0.1 |
+| stage1 weight | 0.5 |
+| stage2 weight | 1.0 |
+| train augmentation prob | 0.9 |
+| rotation | 10 deg |
+| translation | 0.5 m |
+| history xy noise | 0.03 m |
+| history yaw noise | 1.0 deg |
+
 
 ## Requirements
 
