@@ -30,7 +30,7 @@
 | val top1 ADE | 1.3119 |
 | val top1 FDE | 2.9974 |
 
-Дополнительная локальная оценка по всем non-ego агентам из `val_v1_artifact.pt`; это не official nuScenes leaderboard score.
+Дополнительная локальная оценка по всем non-ego агентам из `val_v1_artifact.pt`
 
 | Метрика | Значение |
 |---------|----------|
