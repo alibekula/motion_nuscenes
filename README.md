@@ -35,33 +35,22 @@
 
 ```mermaid
 flowchart TD
-    A["nuScenes raw scenes/maps"] --> B["build_v1_map_store"]
-    B --> C["global map store by map_name"]
+    A["nuScenes raw data"]
 
-    A --> D["V1WindowDataset"]
-    D --> E["scene timelines"]
-    E --> F["ego frames"]
-    E --> G["agent frames"]
-    D --> H["fixed scene windows"]
+    A --> B["scene windows"]
+    B --> C["ego + agent tracks"]
 
-    C --> I["_build_sample(idx)"]
-    F --> I
-    G --> I
-    H --> I
+    A --> D["map_store"]
+    D --> E["local map by ego radius/top-k"]
 
-    I --> J["_collect_agents"]
-    J --> K["agent history/future in ego-frame"]
+    C --> F["V1 sample dicts"]
+    E --> F
 
-    I --> L["_select_local_map around ego"]
-    L --> M["polyline/object tensors in ego-frame"]
+    F --> G["anchor bank from train samples only"]
+    F --> H["V1 artifact"]
+    G --> H
 
-    K --> N["V1 sample dict"]
-    M --> N
-    N --> O["build_artifact_payload"]
-    O --> P["V1 artifact payload + anchor bank"]
-    P --> Q["V1ArtifactDataset"]
-    Q --> R["collate_v1_batch + masks"]
-    R --> S["padded train/val batch"]
+    H --> I["train/val padded batch + optional train aug/noise"]
 ```
 
 ## Модель
