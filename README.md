@@ -2,27 +2,38 @@
 
 Сценовый baseline для multi-agent motion prediction на `nuScenes`.
 
-## Overview
+## Кратко
 
-Этот проект собран как чистый и воспроизводимый baseline для предсказания траекторий в сценах автономного вождения. Базовый принцип здесь простой: один sample соответствует одному V1 scene window с reference keyframe, все агенты и элементы карты приводятся к ego-системе координат этого reference frame, а модель работает с полностью подготовленными scene-level тензорами без runtime-достройки пропусков в training loop.
+Один sample соответствует scene window с reference keyframe. Все агенты, объекты карты и полилинии приводятся к ego-frame этого reference frame. Модель предсказывает 12 future steps (`6` секунд, `dt=0.5`) для каждого агента через двухэтапный anchor-based decoder.
 
-Модель предсказывает `K=64` мультимодальных будущих траекторий для каждого агента на горизонте `6` секунд через двухэтапный anchor-based decoder.
+## Финальная Конфигурация
 
-## Results
+| Параметр | Значение |
+|----------|----------|
+| batch size | 128 |
+| lr | 3e-4 |
+| dropout | 0.1 |
+| stage1 weight | 0.5 |
+| stage2 weight | 1.0 |
+| train augmentation prob | 0.9 |
+| rotation | 10 deg |
+| translation | 0.5 m |
+| history xy noise | 0.03 m |
+| history yaw noise | 1.0 deg |
 
-| Setting | val top1 ADE | val top1 FDE |
-|---------|--------------|--------------|
-| baseline, dropout=0.15, no augmentation | 1.3364 | 3.0463 |
-| dropout=0.10, rotation/translation aug + yaw noise | 1.3119 | 2.9974 |
-| dropout=0.00, rotation/translation aug + yaw noise | 1.3212 | 3.0239 |
-| dropout=0.20, rotation/translation aug + yaw noise | 1.3504 | 3.1003 |
+## Результаты
 
-Лучший результат относится к финальной V1-конфигурации с artifact payload и anchor-based routing.
+Основная validation-метрика из training loop:
 
-Leaderboard-like validation metrics for `best_model_noise_do01.pt`, computed with `evaluate_leaderboard.py` on `val_v1_artifact.pt`, excluding ego agents and using a 2m miss threshold:
+| Метрика | Значение |
+|---------|----------|
+| val top1 ADE | 1.3119 |
+| val top1 FDE | 2.9974 |
 
-| Metric | Value |
-|--------|-------|
+Дополнительная локальная оценка по всем non-ego агентам из `val_v1_artifact.pt`; это не official nuScenes leaderboard score.
+
+| Метрика | Значение |
+|---------|----------|
 | Top1ADE | 1.0748 |
 | MinADE_5 | 0.9396 |
 | MinADE_10 | 0.8764 |
@@ -31,128 +42,81 @@ Leaderboard-like validation metrics for `best_model_noise_do01.pt`, computed wit
 | MissRateTopK_2_10 | 0.1890 |
 | num_eval_agents | 26894 |
 
-These are not official nuScenes leaderboard scores: the evaluation uses the local artifact/filtering pipeline. Official submission still requires predictions for the `get_prediction_challenge_split("val")` agent list in the nuScenes `Prediction` JSON format.
+## Данные
 
-## Data Pipeline
+Пайплайн строит V1 artifact payload в `motion_v1/dataloader.py`. В artifact сохраняются готовые scene-level тензоры: history/future агентов, локальная карта, объекты карты, маски и metadata. Anchor bank строится k-means++/k-means по agent-local directional profiles.
 
-Artifact build отделяет подготовку данных от обучения. В репозитории поддерживается один контракт данных: V1 artifact payload из `motion_v1/dataloader.py`.
+Агенты берутся из reference keyframe. Для обучения используются только треки с полной history/future длиной; неполные треки фильтруются.
 
 ```mermaid
 flowchart TD
-    A["nuScenes raw scenes and maps"] --> B["build_v1_map_store"]
-    B --> C["global map store by map_name"]
-
-    A --> D["V1WindowDataset"]
-    D --> E["_index_scenes"]
-    E --> F["ego frames by scene"]
-    E --> G["agent frames by scene"]
-    D --> H["_build_windows"]
-    H --> I["fixed scene windows"]
-
-    C --> J["_build_sample(idx)"]
-    F --> J
-    G --> J
-    I --> J
-
-    J --> K["_collect_agents"]
-    K --> K2["_build_agent_entry"]
-    K2 --> L["agent tensors"]
-
-    J --> M["_select_local_map"]
-    M --> N["map tensors"]
-
-    L --> P["V1 sample dict"]
-    N --> P
-    P --> Q["build_artifact_payload"]
-    Q --> R["V1 artifact payload"]
-
-    R --> S["V1ArtifactDataset.__getitem__ + optional augmentation"]
-    S --> T["collate_v1_batch"]
-    T --> U["padded scene batch"]
+    A["nuScenes scenes/maps"] --> B["map store"]
+    A --> C["V1WindowDataset"]
+    C --> D["scene window"]
+    D --> E["agents history/future"]
+    D --> F["local map crop"]
+    E --> G["V1 artifact"]
+    F --> G
+    G --> H["V1ArtifactDataset"]
+    H --> I["collate + masks"]
+    I --> J["train batch"]
 ```
 
-1. `Scene windows`
-   Для финального лучшего запуска использовались окна с историей и будущим фиксированной длины.
-2. `Agent selection`
-   Целевые агенты выбираются из reference keyframe; для каждого собирается фиксированное history+future окно.
-3. `Map store`
-   Строится один раз на уровень `map_name`; lane/connector/divider геометрия векторизуется заранее, а локальный контекст сцены выбирается вокруг ego-позиции.
-4. `Anchor bank`
-   Строится k-means++/k-means по agent-local directional profiles и используется как routing-пространство для мультимодального предсказания.
-5. `Artifacts`
-   Сохраняются на диск, после чего train loader в основном только читает, паддит и возвращает готовые тензоры.
+## Модель
 
-## Architecture
+- `HistoryEncoder`: GRU по истории каждого агента.
+- `MapEncoder`: кодирует polyline tokens и map object tokens.
+- `SceneEncoder`: transformer over agents/map tokens с pose encoding и relative bias.
+- `Decoder stage1`: промежуточное 6-step предсказание.
+- `Decoder stage2`: финальное 12-step мультимодальное предсказание.
+
+Финальная схема обучает stage1 и stage2 совместно. Отдельный warmup/freeze для stage1 проверялся, но не дал прироста.
+
+Regression обучается на predicted route selection, чтобы train objective был ближе к inference-time выбору mode. Финально используется строгий top-1 routing.
 
 ```mermaid
 flowchart TD
-    A["padded scene batch"] --> B["HistoryEncoder"]
-    A --> C["motion summaries"]
-    A --> D["MapEncoder"]
-    A --> Q["token poses"]
-
-    B --> E["history tokens"]
-    C --> F["agent tokens"]
+    A["scene batch"] --> B["HistoryEncoder"]
+    A --> C["MapEncoder"]
+    B --> D["agent tokens"]
+    C --> E["map/object tokens"]
+    D --> F["SceneEncoder"]
     E --> F
-
-    D --> G["polyline tokens"]
-    D --> H["object tokens"]
-
-    F --> I["SceneEncoder with pose embeddings and relative bias"]
-    G --> I
-    H --> I
-    Q --> I
-
-    I --> J["scene agent tokens"]
-    J --> K["AnchorDecoder stage1 / A6"]
-    K --> L["6-step scores and trajectories"]
-
-    L --> M["conditioning"]
-    J --> M
-    M --> N["conditioned agent tokens"]
-
-    N --> O["AnchorDecoder stage2 / A12"]
-    O --> P["12-step scores and trajectories"]
+    F --> G["stage1 decoder / 6 steps"]
+    G --> H["conditioning"]
+    F --> H
+    H --> I["stage2 decoder / 12 steps"]
+    I --> J["scores + trajectories"]
 ```
 
-## Loss Configuration
-
-| Parameter | Value |
-|-----------|-------|
-| soft_anchor_topk | 6 |
-| soft_anchor_tau | 0.2 |
-| predicted_topk | 3 |
-| predicted_anchor_detach | True |
-| cls_focal_gamma | 1.5 |
-| stationary_cls_weight | 0.4 |
-| gt_cond_weight | 0 |
-
-В финальной схеме stage2 обучается на предсказанном выходе stage1, а `detach=True` на mixture-routing помогает не портить классификационную ветку регрессионными градиентами.
-
-## Key Ablations
-
-| Setting | val top1 ADE |
-|---------|---------|
-| baseline, dropout=0.15, no augmentation | 1.3364 |
-| train aug prob=0.2, rotation only | 1.3442 |
-| stage1_weight=0.25 | 1.3492 |
-| dropout=0.20, no augmentation | 1.3621 |
-| dropout=0.10, rotation/translation aug + yaw noise | 1.3119 |
-| dropout=0.00, rotation/translation aug + yaw noise | 1.3212 |
-
-## Qualitative Example
-
-Ниже показаны BEV-сцены с историей движения, ground-truth будущим и top-1 предсказанием в ego-frame.
-
-![BEV trajectory example](docs/assets/bev_example.png)
+## Примеры
 
 ![Full scene prediction sample 1](docs/assets/prediction_full_scene_1.png)
 
-Sample 1 highlights a data limitation: several cars are queued on the road before a barrier with almost empty motion history, so the model reasonably treats them as stationary.
+Sample 1 показывает ограничение данных: машины стоят перед barrier, история почти пустая, поэтому модель ожидаемо трактует их как stationary.
 
 ![Full scene prediction sample 65](docs/assets/prediction_full_scene_65.png)
 
-Sample 65 shows a modeling limitation: the top-1 anchor can be geometrically close while still not being the best semantic/map-consistent choice.
+Sample 65 показывает ограничение модели: top-1 anchor может быть геометрически близким, но не самым семантически/map-consistent выбором.
+
+## Структура
+
+```text
+motion_nuscenes/
+├── motion_v1/
+│   ├── dataloader.py
+│   ├── model.py
+│   ├── categories.py
+│   ├── geometry.py
+│   └── __init__.py
+├── data/
+│   ├── nuscenes_utils.py
+│   └── __init__.py
+├── docs/
+│   └── assets/
+├── train.py
+└── README.md
+```
 
 ## Requirements
 
@@ -162,29 +126,4 @@ nuscenes-devkit
 numpy
 tqdm
 shapely
-```
-
-## Project Structure
-
-`evaluate_leaderboard.py` computes local leaderboard-like validation metrics from a saved checkpoint and artifact.
-
-`motion_v1` содержит единственный актуальный пайплайн: сборку V1 artifact payload, dataloader, модель, loss и геометрические утилиты. `data` оставлен только для небольших `nuScenes`-специфичных helper-функций, которые нужны V1-загрузчику.
-
-```text
-motion_nuscenes/
-├── motion_v1/               # модель, V1 dataloader и базовые геометрические утилиты
-│   ├── dataloader.py
-│   ├── model.py
-│   ├── categories.py
-│   ├── geometry.py
-│   └── __init__.py
-├── data/                    # nuScenes utilities для V1 dataloader
-│   ├── nuscenes_utils.py
-│   └── __init__.py
-├── docs/
-│   └── assets/
-│       └── bev_example.png
-├── .gitignore
-├── README.md
-└── train.py
 ```
