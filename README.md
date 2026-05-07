@@ -10,12 +10,28 @@
 
 ## Results
 
-| Metric | Value |
-|--------|-------|
-| val top1 ADE | 1.4193 |
-| val top1 FDE | 3.2450 |
+| Setting | val top1 ADE | val top1 FDE |
+|---------|--------------|--------------|
+| baseline, dropout=0.15, no augmentation | 1.3364 | 3.0463 |
+| dropout=0.10, rotation/translation aug + yaw noise | 1.3119 | 2.9974 |
+| dropout=0.00, rotation/translation aug + yaw noise | 1.3212 | 3.0239 |
+| dropout=0.20, rotation/translation aug + yaw noise | 1.3504 | 3.1003 |
 
 Лучший результат относится к финальной V1-конфигурации с artifact payload и anchor-based routing.
+
+Leaderboard-like validation metrics for `best_model_noise_do01.pt`, computed with `evaluate_leaderboard.py` on `val_v1_artifact.pt`, excluding ego agents and using a 2m miss threshold:
+
+| Metric | Value |
+|--------|-------|
+| Top1ADE | 1.0748 |
+| MinADE_5 | 0.9396 |
+| MinADE_10 | 0.8764 |
+| MinFDE_1 | 2.4265 |
+| MissRateTopK_2_5 | 0.2055 |
+| MissRateTopK_2_10 | 0.1890 |
+| num_eval_agents | 26894 |
+
+These are not official nuScenes leaderboard scores: the evaluation uses the local artifact/filtering pipeline. Official submission still requires predictions for the `get_prediction_challenge_split("val")` agent list in the nuScenes `Prediction` JSON format.
 
 ## Data Pipeline
 
@@ -117,9 +133,12 @@ flowchart TD
 
 | Setting | val top1 ADE |
 |---------|---------|
-| hard WTA | 1.4378 |
-| predicted_topk=6 | 1.4262 |
-| predicted_topk=3 | 1.4193 |
+| baseline, dropout=0.15, no augmentation | 1.3364 |
+| train aug prob=0.2, rotation only | 1.3442 |
+| stage1_weight=0.25 | 1.3492 |
+| dropout=0.20, no augmentation | 1.3621 |
+| dropout=0.10, rotation/translation aug + yaw noise | 1.3119 |
+| dropout=0.00, rotation/translation aug + yaw noise | 1.3212 |
 
 ## Qualitative Example
 
@@ -138,6 +157,8 @@ shapely
 ```
 
 ## Project Structure
+
+`evaluate_leaderboard.py` computes local leaderboard-like validation metrics from a saved checkpoint and artifact.
 
 `motion_v1` содержит единственный актуальный пайплайн: сборку V1 artifact payload, dataloader, модель, loss и геометрические утилиты. `data` оставлен только для небольших `nuScenes`-специфичных helper-функций, которые нужны V1-загрузчику.
 
