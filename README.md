@@ -35,16 +35,33 @@
 
 ```mermaid
 flowchart TD
-    A["nuScenes scenes/maps"] --> B["map store"]
-    A --> C["V1WindowDataset"]
-    C --> D["scene window"]
-    D --> E["agents history/future"]
-    D --> F["local map crop"]
-    E --> G["V1 artifact"]
-    F --> G
-    G --> H["V1ArtifactDataset"]
-    H --> I["collate + masks"]
-    I --> J["train batch"]
+    A["nuScenes raw scenes/maps"] --> B["build_v1_map_store"]
+    B --> C["global map store by map_name"]
+
+    A --> D["V1WindowDataset"]
+    D --> E["scene timelines"]
+    E --> F["ego frames"]
+    E --> G["agent frames"]
+    D --> H["fixed scene windows"]
+
+    C --> I["_build_sample(idx)"]
+    F --> I
+    G --> I
+    H --> I
+
+    I --> J["_collect_agents"]
+    J --> K["agent history/future in ego-frame"]
+
+    I --> L["_select_local_map around ego"]
+    L --> M["polyline/object tensors in ego-frame"]
+
+    K --> N["V1 sample dict"]
+    M --> N
+    N --> O["build_artifact_payload"]
+    O --> P["V1 artifact payload + anchor bank"]
+    P --> Q["V1ArtifactDataset"]
+    Q --> R["collate_v1_batch + masks"]
+    R --> S["padded train/val batch"]
 ```
 
 ## Модель
@@ -61,17 +78,32 @@ Regression обучается на predicted route selection, чтобы train o
 
 ```mermaid
 flowchart TD
-    A["scene batch"] --> B["HistoryEncoder"]
-    A --> C["MapEncoder"]
-    B --> D["agent tokens"]
-    C --> E["map/object tokens"]
-    D --> F["SceneEncoder"]
-    E --> F
-    F --> G["stage1 decoder / 6 steps"]
-    G --> H["conditioning"]
-    F --> H
-    H --> I["stage2 decoder / 12 steps"]
-    I --> J["scores + trajectories"]
+    A["padded train/val batch"] --> B["history features"]
+    A --> C["polyline/object features"]
+    A --> D["token poses + masks"]
+
+    B --> E["HistoryEncoder / GRU"]
+    B --> F["motion summaries"]
+    E --> G["agent tokens"]
+    F --> G
+
+    C --> H["MapEncoder"]
+    H --> I["polyline tokens"]
+    H --> J["object tokens"]
+
+    G --> K["SceneEncoder"]
+    I --> K
+    J --> K
+    D --> K
+    K --> L["scene agent tokens"]
+
+    L --> M["AnchorDecoder stage1 / A6"]
+    M --> N["6-step scores + local trajectories"]
+    N --> O["conditioning features"]
+    L --> O
+    O --> P["conditioned agent tokens"]
+    P --> Q["AnchorDecoder stage2 / A12"]
+    Q --> R["12-step scores + local trajectories"]
 ```
 
 ## Примеры
