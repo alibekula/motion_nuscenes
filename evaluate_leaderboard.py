@@ -34,15 +34,28 @@ def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[s
     return out
 
 
-def _build_model_cfg(dataset: V1ArtifactDataset, checkpoint: dict[str, Any]) -> V1ModelConfig:
+def _anchor_bank_from_sources(dataset: V1ArtifactDataset, checkpoint: dict[str, Any]) -> dict[str, Any]:
+    if dataset.anchor_bank is not None:
+        return dataset.anchor_bank
+
+    state_dict = checkpoint.get("model_state_dict")
+    if not isinstance(state_dict, dict) or "A12" not in state_dict or "A6" not in state_dict:
+        raise ValueError("Artifact has no anchor bank and checkpoint does not contain A12/A6 buffers.")
+
+    model_cfg = checkpoint.get("model_cfg")
+    return {
+        "full_bank": state_dict["A12"].detach().cpu(),
+        "prefix_bank": state_dict["A6"].detach().cpu(),
+        "r_max": float(getattr(model_cfg, "r_max", 1.0)),
+        "method": "checkpoint_buffers",
+    }
+
+
+def _build_model_cfg(dataset: V1ArtifactDataset, checkpoint: dict[str, Any], anchor_bank: dict[str, Any]) -> V1ModelConfig:
     if isinstance(checkpoint.get("model_cfg"), V1ModelConfig):
         return checkpoint["model_cfg"]
 
     metadata = dataset.metadata
-    anchor_bank = dataset.anchor_bank
-    if anchor_bank is None:
-        raise ValueError("Artifact must contain an anchor bank.")
-
     train_args = checkpoint.get("train_args", {})
     return V1ModelConfig(
         history_feature_dim=int(_meta_get(metadata, "history_feature_dim")),
@@ -224,12 +237,10 @@ def main() -> None:
 
     device = torch.device(args.device)
     dataset = V1ArtifactDataset(args.artifact, augmentation=None)
-    if dataset.anchor_bank is None:
-        raise ValueError("Artifact must contain an anchor bank.")
-
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model_cfg = _build_model_cfg(dataset, checkpoint)
-    model = V1MotionModel(model_cfg, dataset.anchor_bank)
+    anchor_bank = _anchor_bank_from_sources(dataset, checkpoint)
+    model_cfg = _build_model_cfg(dataset, checkpoint, anchor_bank)
+    model = V1MotionModel(model_cfg, anchor_bank)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
 
