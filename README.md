@@ -44,7 +44,7 @@
 
 ## Данные
 
-Пайплайн строит V1 artifact payload в `motion_v1/dataloader.py`. В artifact сохраняются готовые scene-level тензоры: history/future агентов, локальная карта, объекты карты, маски и metadata. Anchor bank строится k-means++/k-means по agent-local directional profiles.
+Пайплайн строит V1 artifact payload в `motion_v1/dataloader.py`. В artifact сохраняются готовые scene-level тензоры: history/future агентов, локальная карта, объекты карты, маски и metadata. В текущей версии anchor bank один: k-means++ initialization + k-means refinement по agent-local directional profiles; старые random/kNN варианты не поддерживаются.
 
 Агенты берутся из reference keyframe. Для обучения используются только треки с полной history/future длиной; неполные треки фильтруются.
 

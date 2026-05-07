@@ -35,7 +35,7 @@ class V1DataConfig:
     object_feature_dim: int = 10
     anchor_k12: int = 64
     anchor_kmeans_iters: int = 25
-    anchor_random_seed: int = 13
+    anchor_kmeans_seed: int = 13
     anchor_stationary_threshold_m: float = 0.5
 
 
@@ -972,7 +972,7 @@ def build_anchor_bank_kmeans(samples: list[dict[str, Any]], cfg: V1DataConfig) -
     future_local_array = np.stack(future_local_list, axis=0).astype(np.float32, copy=False)
     flat = profile_array.reshape(profile_array.shape[0], -1)
 
-    rng = np.random.default_rng(cfg.anchor_random_seed)
+    rng = np.random.default_rng(cfg.anchor_kmeans_seed)
     num_anchors = min(cfg.anchor_k12, flat.shape[0])
     center_idx = _init_kmeans_plus_plus(flat, num_anchors, rng)
     centers = profile_array[center_idx].copy()
@@ -1028,7 +1028,7 @@ def build_anchor_bank_kmeans(samples: list[dict[str, Any]], cfg: V1DataConfig) -
         "empty_cluster_replacements": int(empty_replacements),
         "mean_assignment_distance": float(assignment_distance.mean()),
         "max_assignment_distance": float(assignment_distance.max()),
-        "seed": int(cfg.anchor_random_seed),
+        "seed": int(cfg.anchor_kmeans_seed),
     }
 
 

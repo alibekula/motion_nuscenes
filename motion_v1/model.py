@@ -98,10 +98,7 @@ class V1LossConfig:
     cls_focal_gamma: float = 1.5
     stationary_cls_weight: float = 0.5
     soft_anchor_tau: float = 0.2
-    soft_anchor_topk: int | None = None
-    regression_mode: str = "gt_wta"
-    predicted_anchor_topk: int | None = 3
-    predicted_anchor_detach: bool = True
+    soft_anchor_topk: int | None = 1
 
 
 class HistoryEncoder(nn.Module):
@@ -619,14 +616,7 @@ class V1MotionModel(nn.Module):
             nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
         )
 
-    def forward(
-        self,
-        batch: dict[str, torch.Tensor],
-        *,
-        gt_cond_weight: float = 0.0,
-        gt_future_local: torch.Tensor | None = None,
-        gt_k6: torch.Tensor | None = None,
-    ) -> dict[str, Any]:
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, Any]:
         history_features = batch["history_features"]
         agent_pad_mask = batch["agent_pad_mask"].to(device=history_features.device, dtype=torch.bool)
 
@@ -667,20 +657,12 @@ class V1MotionModel(nn.Module):
             self.cfg.dt,
         )
 
-        if gt_cond_weight > 0.0 and gt_future_local is None and "future_positions_ego" in batch:
-            gt_future_local = future_positions_local_from_history(batch)
-        if gt_cond_weight > 0.0 and gt_k6 is None and gt_future_local is not None:
-            gt_k6 = assign_gt_to_anchor_bank(gt_future_local, self.A6)
-
         conditioning = self._conditioning(
             score6=score6,
             traj6=traj6,
             z_dir=z6_dir,
             z_stat=z6_stat,
             v_last=v_last,
-            gt_future_local=gt_future_local,
-            gt_k6=gt_k6,
-            gt_cond_weight=gt_cond_weight,
         )
         conditioned_agent_tokens = self.cond_mlp(torch.cat([scene_agent_tokens, conditioning], dim=-1))
         conditioned_agent_tokens = conditioned_agent_tokens.masked_fill(agent_pad_mask.unsqueeze(-1), 0.0)
@@ -763,9 +745,6 @@ class V1MotionModel(nn.Module):
         z_dir: torch.Tensor,
         z_stat: torch.Tensor,
         v_last: torch.Tensor,
-        gt_future_local: torch.Tensor | None,
-        gt_k6: torch.Tensor | None,
-        gt_cond_weight: float,
     ) -> torch.Tensor:
         num_classes = int(score6.shape[-1])
         topk = min(int(self.cfg.cond_topk), num_classes)
@@ -788,22 +767,7 @@ class V1MotionModel(nn.Module):
         end_speed = end_delta.norm(dim=-1) / max(self.cfg.dt, 1e-6)
         avg_acc = (end_speed - v_last) / 3.0
 
-        predicted = torch.cat([expected_plan, end_pos, end_dir, end_speed.unsqueeze(-1), avg_acc.unsqueeze(-1)], dim=-1)
-        if gt_cond_weight <= 0.0 or gt_future_local is None or gt_k6 is None:
-            return predicted
-
-        gt_prefix = gt_future_local[:, :, :6]
-        gt_class = gt_k6.clamp(0, z_all.shape[2] - 1)
-        gt_plan = z_all.gather(
-            2,
-            gt_class[:, :, None, None].expand(-1, -1, 1, z_all.shape[-1]),
-        ).squeeze(2)
-        gt_delta = gt_prefix[:, :, 5] - gt_prefix[:, :, 4]
-        gt_dir = gt_delta / gt_delta.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-        gt_speed = gt_delta.norm(dim=-1) / max(self.cfg.dt, 1e-6)
-        gt_acc = (gt_speed - v_last) / 3.0
-        target = torch.cat([gt_plan, gt_prefix[:, :, 5], gt_dir, gt_speed.unsqueeze(-1), gt_acc.unsqueeze(-1)], dim=-1)
-        return (1.0 - gt_cond_weight) * predicted + gt_cond_weight * target
+        return torch.cat([expected_plan, end_pos, end_dir, end_speed.unsqueeze(-1), avg_acc.unsqueeze(-1)], dim=-1)
 
 
 def _to_tensor_anchor_bank(bank: Any) -> torch.Tensor:
@@ -885,11 +849,6 @@ def compute_anchor_direction_distance(
     bank = anchor_bank.to(device=gt.device, dtype=gt.dtype).view(1, 1, *anchor_bank.shape)
     dot = (step_dir.unsqueeze(2) * bank).sum(dim=-1)
     return (step_weight.unsqueeze(2) * (1.0 - dot)).sum(dim=-1)
-
-
-def assign_gt_to_anchor_bank(gt_future_local: torch.Tensor, anchor_bank: torch.Tensor) -> torch.Tensor:
-    distance = compute_anchor_direction_distance(gt_future_local, anchor_bank)
-    return distance.argmin(dim=-1)
 
 
 def build_soft_anchor_targets(
@@ -976,9 +935,6 @@ def compute_v1_losses(
         stationary_cls_weight=cfg.stationary_cls_weight,
         soft_anchor_tau=cfg.soft_anchor_tau,
         soft_anchor_topk=cfg.soft_anchor_topk,
-        regression_mode=cfg.regression_mode,
-        predicted_anchor_topk=cfg.predicted_anchor_topk,
-        predicted_anchor_detach=cfg.predicted_anchor_detach,
     )
     stage2_terms = _compute_stage_loss_terms(
         stage_outputs=outputs["stage2"],
@@ -990,9 +946,6 @@ def compute_v1_losses(
         stationary_cls_weight=cfg.stationary_cls_weight,
         soft_anchor_tau=cfg.soft_anchor_tau,
         soft_anchor_topk=cfg.soft_anchor_topk,
-        regression_mode=cfg.regression_mode,
-        predicted_anchor_topk=cfg.predicted_anchor_topk,
-        predicted_anchor_detach=cfg.predicted_anchor_detach,
     )
 
     total_loss = (
@@ -1032,9 +985,6 @@ def _compute_stage_loss_terms(
     stationary_cls_weight: float,
     soft_anchor_tau: float,
     soft_anchor_topk: int | None,
-    regression_mode: str,
-    predicted_anchor_topk: int | None,
-    predicted_anchor_detach: bool,
 ) -> dict[str, torch.Tensor]:
     horizon = int(stage_outputs["directional_anchor_bank"].shape[1])
     gt_local = gt_future_local[..., :horizon, :]
@@ -1048,7 +998,6 @@ def _compute_stage_loss_terms(
         gt_future_local=gt_future_local,
         anchor_bank=stage_outputs["directional_anchor_bank"],
     )
-    anchor_idx = anchor_distance.argmin(dim=-1)
     cls_target = build_soft_anchor_targets(
         anchor_distance=anchor_distance,
         direction_weight=direction_weight,
@@ -1070,10 +1019,6 @@ def _compute_stage_loss_terms(
     )
     gathered_local, gathered_progress = _select_regression_prediction(
         stage_outputs=stage_outputs,
-        anchor_idx=anchor_idx,
-        regression_mode=regression_mode,
-        predicted_anchor_topk=predicted_anchor_topk,
-        predicted_anchor_detach=predicted_anchor_detach,
     )
 
     pos_loss = _weighted_regression_loss(
@@ -1109,36 +1054,11 @@ def _compute_stage_loss_terms(
 
 def _select_regression_prediction(
     stage_outputs: dict[str, torch.Tensor],
-    anchor_idx: torch.Tensor,
-    regression_mode: str,
-    predicted_anchor_topk: int | None,
-    predicted_anchor_detach: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     directional_local = stage_outputs["directional_local_trajectories"]
     directional_progress = stage_outputs["directional_progress"]
-
-    if regression_mode == "gt_wta":
-        return _gather_mode(directional_local, anchor_idx), _gather_mode(directional_progress, anchor_idx)
-
-    if regression_mode != "predicted_topk":
-        raise ValueError(f"Unsupported regression_mode: {regression_mode!r}.")
-
-    directional_logits = stage_outputs["logits"][..., :-1]
-    mode_weight = F.softmax(directional_logits, dim=-1)
-
-    num_anchors = int(mode_weight.shape[-1])
-    if predicted_anchor_topk is not None and 0 < predicted_anchor_topk < num_anchors:
-        topk_idx = mode_weight.topk(predicted_anchor_topk, dim=-1).indices
-        keep = torch.zeros_like(mode_weight).scatter_(-1, topk_idx, 1.0)
-        mode_weight = mode_weight * keep
-        mode_weight = mode_weight / mode_weight.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-
-    if predicted_anchor_detach:
-        mode_weight = mode_weight.detach()
-
-    blended_local = (mode_weight.unsqueeze(-1).unsqueeze(-1) * directional_local).sum(dim=2)
-    blended_progress = (mode_weight.unsqueeze(-1) * directional_progress).sum(dim=2)
-    return blended_local, blended_progress
+    anchor_idx = stage_outputs["logits"][..., :-1].argmax(dim=-1)
+    return _gather_mode(directional_local, anchor_idx), _gather_mode(directional_progress, anchor_idx)
 
 
 def _gather_mode(values: torch.Tensor, mode_idx: torch.Tensor) -> torch.Tensor:

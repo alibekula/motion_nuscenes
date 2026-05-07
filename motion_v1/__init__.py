@@ -14,7 +14,6 @@ from .model import (
     V1LossConfig,
     V1ModelConfig,
     V1MotionModel,
-    assign_gt_to_anchor_bank,
     compute_v1_losses,
     future_positions_local_from_history,
 )
@@ -32,7 +31,6 @@ __all__ = [
     "V1ModelConfig",
     "V1MotionModel",
     "V1WindowDataset",
-    "assign_gt_to_anchor_bank",
     "build_anchor_bank_kmeans",
     "build_v1_loader",
     "build_v1_map_store",

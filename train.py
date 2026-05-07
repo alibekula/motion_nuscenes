@@ -4,7 +4,6 @@ import argparse
 import hashlib
 import random
 from contextlib import nullcontext
-from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -48,22 +47,6 @@ def _seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def _positive_int_or_none(value):
-    value = int(value)
-    return value if value > 0 else None
-
-
-def _loss_cfg_for_epoch(base_cfg, epoch_idx, stage1_warmup_epochs):
-    if epoch_idx < int(stage1_warmup_epochs):
-        return replace(base_cfg, stage2_weight=0.0)
-    return base_cfg
-
-
-def _set_module_trainable(module, trainable):
-    for parameter in module.parameters():
-        parameter.requires_grad_(bool(trainable))
-
-
 def train_one_epoch(
     model,
     loader,
@@ -73,12 +56,8 @@ def train_one_epoch(
     scaler,
     grad_clip=1.0,
     use_amp=True,
-    gt_cond_weight=0.0,
-    freeze_decoder1=False,
 ):
     model.train()
-    if freeze_decoder1:
-        model.decoder1.eval()
     running = {}
     n_batches = 0
     amp_enabled = bool(use_amp and device.type == "cuda")
@@ -90,7 +69,7 @@ def train_one_epoch(
 
         amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if amp_enabled else nullcontext()
         with amp_ctx:
-            outputs = model(batch, gt_cond_weight=gt_cond_weight)
+            outputs = model(batch)
             loss, metrics = compute_v1_losses(outputs, batch, loss_cfg)
 
         if amp_enabled:
@@ -129,7 +108,7 @@ def validate_one_epoch(model, loader, device, loss_cfg):
     pbar = tqdm(loader, desc="Val", leave=False)
     for batch in pbar:
         batch = move_batch_to_device(batch, device)
-        outputs = model(batch, gt_cond_weight=0.0)
+        outputs = model(batch)
         _, metrics = compute_v1_losses(outputs, batch, loss_cfg)
 
         for key, value in metrics.items():
@@ -144,7 +123,7 @@ def main():
     parser.add_argument("--train-artifact", type=str, required=True, help="Путь к train-артефакту .pt")
     parser.add_argument("--val-artifact", type=str, required=True, help="Путь к val-артефакту .pt")
     parser.add_argument("--checkpoint-path", type=str, default="artifacts/best_model.pt")
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -153,28 +132,20 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--disable-amp", action="store_true")
     parser.add_argument("--seed", type=int, default=13)
-    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--disable-pose-encoding", action="store_true")
     parser.add_argument("--disable-relative-encoding", action="store_true")
     parser.add_argument("--pose-radius-m", type=float, default=80.0)
-    parser.add_argument("--train-aug-prob", type=float, default=0.8)
+    parser.add_argument("--train-aug-prob", type=float, default=0.9)
     parser.add_argument("--train-max-rotation-deg", type=float, default=10.0)
-    parser.add_argument("--train-translation-std-m", type=float, default=0.0)
-    parser.add_argument("--train-history-xy-noise-std-m", type=float, default=0.0)
-    parser.add_argument("--train-history-yaw-noise-std-deg", type=float, default=0.0)
+    parser.add_argument("--train-translation-std-m", type=float, default=0.5)
+    parser.add_argument("--train-history-xy-noise-std-m", type=float, default=0.03)
+    parser.add_argument("--train-history-yaw-noise-std-deg", type=float, default=1.0)
     parser.add_argument("--stage1-weight", type=float, default=0.5)
     parser.add_argument("--stage2-weight", type=float, default=1.0)
-    parser.add_argument("--stage1-warmup-epochs", type=int, default=0)
-    parser.add_argument("--freeze-decoder1-after-warmup", action="store_true")
     parser.add_argument("--cls-focal-gamma", type=float, default=1.5)
     parser.add_argument("--stationary-cls-weight", type=float, default=0.4)
     parser.add_argument("--soft-anchor-tau", type=float, default=0.2)
-    parser.add_argument("--soft-anchor-topk", type=int, default=6, help="Use 0 to disable top-k masking.")
-    parser.add_argument("--regression-mode", type=str, choices=("gt_wta", "predicted_topk"), default="predicted_topk")
-    parser.add_argument("--predicted-anchor-topk", type=int, default=3, help="Use 0 to use all predicted anchors.")
-    parser.add_argument("--predicted-anchor-detach", dest="predicted_anchor_detach", action="store_true", default=True)
-    parser.add_argument("--no-predicted-anchor-detach", dest="predicted_anchor_detach", action="store_false")
-    parser.add_argument("--gt-cond-weight", type=float, default=0.0)
     args = parser.parse_args()
 
     _seed_everything(args.seed)
@@ -248,10 +219,7 @@ def main():
         cls_focal_gamma=args.cls_focal_gamma,
         stationary_cls_weight=args.stationary_cls_weight,
         soft_anchor_tau=args.soft_anchor_tau,
-        soft_anchor_topk=_positive_int_or_none(args.soft_anchor_topk),
-        regression_mode=args.regression_mode,
-        predicted_anchor_topk=_positive_int_or_none(args.predicted_anchor_topk),
-        predicted_anchor_detach=args.predicted_anchor_detach,
+        soft_anchor_topk=1,
     )
     print(f"Model config: {model_cfg}")
     print(f"Loss config: {loss_cfg}")
@@ -260,31 +228,17 @@ def main():
     best_val_top1_ade = float("inf")
     checkpoint_path = Path(args.checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    decoder1_frozen = False
 
     for epoch in range(args.epochs):
-        should_freeze_decoder1 = (
-            args.freeze_decoder1_after_warmup
-            and int(args.stage1_warmup_epochs) > 0
-            and epoch >= int(args.stage1_warmup_epochs)
-        )
-        if should_freeze_decoder1 and not decoder1_frozen:
-            _set_module_trainable(model.decoder1, False)
-            decoder1_frozen = True
-            print(f"Decoder1 frozen after {args.stage1_warmup_epochs} warmup epochs.")
-
-        train_loss_cfg = _loss_cfg_for_epoch(loss_cfg, epoch, args.stage1_warmup_epochs)
         train_metrics = train_one_epoch(
             model,
             train_loader,
             optimizer,
             device,
-            train_loss_cfg,
+            loss_cfg,
             scaler,
             grad_clip=args.grad_clip,
             use_amp=not args.disable_amp,
-            gt_cond_weight=args.gt_cond_weight,
-            freeze_decoder1=decoder1_frozen,
         )
         val_metrics = validate_one_epoch(model, val_loader, device, loss_cfg)
         scheduler.step()
@@ -292,8 +246,7 @@ def main():
         print(
             f"Epoch {epoch + 1:02d}/{args.epochs} | "
             f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
-            f"S1/S2 weight: {train_loss_cfg.stage1_weight:.2f}/{train_loss_cfg.stage2_weight:.2f} | "
-            f"D1 frozen: {int(decoder1_frozen)} | "
+            f"S1/S2 weight: {loss_cfg.stage1_weight:.2f}/{loss_cfg.stage2_weight:.2f} | "
             f"Train top1 ADE: {train_metrics['stage2_top1_ade']:.4f} | "
             f"Val top1 ADE: {val_metrics['stage2_top1_ade']:.4f} | "
             f"Val top1 FDE: {val_metrics['stage2_top1_fde_l2']:.4f}"
