@@ -142,9 +142,17 @@ flowchart TD
 
 ## Qualitative Example
 
-Ниже показан пример BEV-сцены с историей движения, ground-truth будущим и предсказанной траекторией в ego-frame.
+Ниже показаны BEV-сцены с историей движения, ground-truth будущим и top-1 предсказанием в ego-frame.
 
 ![BEV trajectory example](docs/assets/bev_example.png)
+
+![Full scene prediction sample 1](docs/assets/prediction_full_scene_1.png)
+
+Sample 1 highlights a data limitation: several cars are queued on the road before a barrier with almost empty motion history, so the model reasonably treats them as stationary.
+
+![Full scene prediction sample 65](docs/assets/prediction_full_scene_65.png)
+
+Sample 65 shows a modeling limitation: the top-1 anchor can be geometrically close while still not being the best semantic/map-consistent choice.
 
 ## Requirements
 
