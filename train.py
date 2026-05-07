@@ -64,53 +64,6 @@ def _set_module_trainable(module, trainable):
         parameter.requires_grad_(bool(trainable))
 
 
-def _create_ema_state(model):
-    return {
-        name: value.detach().clone()
-        for name, value in model.state_dict().items()
-        if torch.is_floating_point(value)
-    }
-
-
-@torch.no_grad()
-def _update_ema_state(model, ema_state, decay):
-    model_state = model.state_dict()
-    for name, ema_value in ema_state.items():
-        ema_value.mul_(float(decay)).add_(model_state[name].detach(), alpha=1.0 - float(decay))
-
-
-@torch.no_grad()
-def _swap_in_ema_state(model, ema_state):
-    if ema_state is None:
-        return None
-
-    backup = {}
-    model_state = model.state_dict()
-    for name, ema_value in ema_state.items():
-        backup[name] = model_state[name].detach().clone()
-        model_state[name].copy_(ema_value)
-    return backup
-
-
-@torch.no_grad()
-def _restore_model_state(model, backup):
-    if backup is None:
-        return
-
-    model_state = model.state_dict()
-    for name, value in backup.items():
-        model_state[name].copy_(value)
-
-
-def _state_dict_for_save(model, ema_state=None):
-    model_state = model.state_dict()
-    out = {}
-    for name, value in model_state.items():
-        source = ema_state.get(name, value) if ema_state is not None else value
-        out[name] = source.detach().cpu().clone()
-    return out
-
-
 def train_one_epoch(
     model,
     loader,
@@ -122,8 +75,6 @@ def train_one_epoch(
     use_amp=True,
     gt_cond_weight=0.0,
     freeze_decoder1=False,
-    ema_state=None,
-    ema_decay=0.0,
 ):
     model.train()
     if freeze_decoder1:
@@ -152,9 +103,6 @@ def train_one_epoch(
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip, error_if_nonfinite=False)
             optimizer.step()
-
-        if ema_state is not None:
-            _update_ema_state(model, ema_state, ema_decay)
 
         metrics["grad_norm"] = float(grad_norm.item()) if torch.isfinite(grad_norm) else 0.0
         metrics["lr"] = float(optimizer.param_groups[0]["lr"])
@@ -206,7 +154,6 @@ def main():
     parser.add_argument("--disable-amp", action="store_true")
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--ema-decay", type=float, default=0.0, help="Use 0 to disable EMA validation/checkpointing.")
     parser.add_argument("--disable-pose-encoding", action="store_true")
     parser.add_argument("--disable-relative-encoding", action="store_true")
     parser.add_argument("--pose-radius-m", type=float, default=80.0)
@@ -292,9 +239,6 @@ def main():
         pose_radius_m=args.pose_radius_m,
     )
     model = V1MotionModel(model_cfg, anchor_bank).to(device)
-    if args.ema_decay < 0.0 or args.ema_decay >= 1.0:
-        raise ValueError("--ema-decay must be in [0, 1). Use 0 to disable EMA.")
-    ema_state = _create_ema_state(model) if args.ema_decay > 0.0 else None
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.eta_min)
@@ -311,7 +255,6 @@ def main():
     )
     print(f"Model config: {model_cfg}")
     print(f"Loss config: {loss_cfg}")
-    print(f"EMA decay: {args.ema_decay if ema_state is not None else 'off'}")
 
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and not args.disable_amp))
     best_val_top1_ade = float("inf")
@@ -342,14 +285,8 @@ def main():
             use_amp=not args.disable_amp,
             gt_cond_weight=args.gt_cond_weight,
             freeze_decoder1=decoder1_frozen,
-            ema_state=ema_state,
-            ema_decay=args.ema_decay,
         )
-        ema_backup = _swap_in_ema_state(model, ema_state)
-        try:
-            val_metrics = validate_one_epoch(model, val_loader, device, loss_cfg)
-        finally:
-            _restore_model_state(model, ema_backup)
+        val_metrics = validate_one_epoch(model, val_loader, device, loss_cfg)
         scheduler.step()
 
         print(
@@ -364,25 +301,23 @@ def main():
 
         if val_metrics["stage2_top1_ade"] < best_val_top1_ade:
             best_val_top1_ade = val_metrics["stage2_top1_ade"]
-            checkpoint = {
-                "epoch": epoch + 1,
-                "model_state_dict": _state_dict_for_save(model, ema_state),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "model_cfg": model_cfg,
-                "loss_cfg": loss_cfg,
-                "best_val_top1_ade": best_val_top1_ade,
-                "ema_decay": float(args.ema_decay) if ema_state is not None else 0.0,
-                "validated_with_ema": ema_state is not None,
-                "seed": int(args.seed),
-                "train_artifact_path": str(Path(args.train_artifact).resolve()),
-                "val_artifact_path": str(Path(args.val_artifact).resolve()),
-                "train_artifact_sha256": train_artifact_hash,
-                "val_artifact_sha256": val_artifact_hash,
-                "train_args": vars(args),
-            }
-            if ema_state is not None:
-                checkpoint["raw_model_state_dict"] = _state_dict_for_save(model)
-            torch.save(checkpoint, checkpoint_path)
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "model_cfg": model_cfg,
+                    "loss_cfg": loss_cfg,
+                    "best_val_top1_ade": best_val_top1_ade,
+                    "seed": int(args.seed),
+                    "train_artifact_path": str(Path(args.train_artifact).resolve()),
+                    "val_artifact_path": str(Path(args.val_artifact).resolve()),
+                    "train_artifact_sha256": train_artifact_hash,
+                    "val_artifact_sha256": val_artifact_hash,
+                    "train_args": vars(args),
+                },
+                checkpoint_path,
+            )
             print(f"  -> Сохранён новый лучший чекпоинт: {checkpoint_path}")
 
 
